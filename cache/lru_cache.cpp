@@ -1,5 +1,5 @@
-// cache/lru_cache.cpp
 #include "lru_cache.h"
+#include <string>
 
 namespace orangesql {
 
@@ -121,6 +121,7 @@ void LRUCache<Key, Value>::evict() {
     cache_map_.erase(key_to_evict);
 }
 
+// Template instantiations
 template class LRUCache<int, void*>;
 template class LRUCache<std::string, std::string>;
 template class LRUCache<uint64_t, std::vector<char>>;

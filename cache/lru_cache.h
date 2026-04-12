@@ -1,4 +1,3 @@
-// cache/lru_cache.h
 #ifndef LRU_CACHE_H
 #define LRU_CACHE_H
 
@@ -8,6 +7,9 @@
 #include <optional>
 #include <atomic>
 #include <chrono>
+#include <string>
+#include <vector>
+#include <cstdint>
 
 namespace orangesql {
 

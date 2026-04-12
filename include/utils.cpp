@@ -1,4 +1,3 @@
-// include/utils.cpp
 #include "utils.h"
 
 namespace orangesql {

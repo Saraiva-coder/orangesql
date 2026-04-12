@@ -1,4 +1,3 @@
-// include/utils.h
 #ifndef UTILS_H
 #define UTILS_H
 
@@ -10,6 +9,9 @@
 #include <mutex>
 #include <vector>
 #include <algorithm>
+#include <sstream>
+#include <cstring>
+#include <cstdio>
 
 namespace orangesql {
 
@@ -27,11 +29,6 @@ public:
     double elapsed_ms() const {
         auto end = std::chrono::high_resolution_clock::now();
         return std::chrono::duration<double, std::milli>(end - start_).count();
-    }
-    
-    uint64 elapsed_ns() const {
-        auto end = std::chrono::high_resolution_clock::now();
-        return std::chrono::duration_cast<std::chrono::nanoseconds>(end - start_).count();
     }
     
 private:
@@ -52,11 +49,6 @@ public:
     
     static double getDouble(double min, double max) {
         std::uniform_real_distribution<double> dist(min, max);
-        return dist(gen);
-    }
-    
-    static float getFloat(float min, float max) {
-        std::uniform_real_distribution<float> dist(min, max);
         return dist(gen);
     }
     
@@ -101,7 +93,7 @@ public:
     
     static std::vector<std::string> split(const std::string& str, char delimiter) {
         std::vector<std::string> tokens;
-        std::stringstream ss(str);
+        std::istringstream ss(str);
         std::string token;
         while (std::getline(ss, token, delimiter)) {
             std::string trimmed = trim(token);
@@ -119,16 +111,6 @@ public:
     static bool endsWith(const std::string& str, const std::string& suffix) {
         return str.size() >= suffix.size() && str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
     }
-    
-    static std::string replace(const std::string& str, const std::string& from, const std::string& to) {
-        std::string result = str;
-        size_t pos = 0;
-        while ((pos = result.find(from, pos)) != std::string::npos) {
-            result.replace(pos, from.length(), to);
-            pos += to.length();
-        }
-        return result;
-    }
 };
 
 class MathUtils {
@@ -144,25 +126,13 @@ public:
     static bool isPowerOfTwo(uint64 value) {
         return value && !(value & (value - 1));
     }
-    
-    static uint64 nextPowerOfTwo(uint64 value) {
-        value--;
-        value |= value >> 1;
-        value |= value >> 2;
-        value |= value >> 4;
-        value |= value >> 8;
-        value |= value >> 16;
-        value |= value >> 32;
-        value++;
-        return value;
-    }
 };
 
 inline std::string formatSize(size_t bytes) {
-    const char* units[] = {"B", "KB", "MB", "GB", "TB", "PB"};
+    const char* units[] = {"B", "KB", "MB", "GB"};
     int unit = 0;
     double size = static_cast<double>(bytes);
-    while (size >= 1024.0 && unit < 5) {
+    while (size >= 1024.0 && unit < 3) {
         size /= 1024.0;
         unit++;
     }

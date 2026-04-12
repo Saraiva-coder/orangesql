@@ -1,4 +1,3 @@
-// include/types.cpp
 #include "types.h"
 #include <sstream>
 #include <iomanip>
