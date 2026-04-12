@@ -1,98 +1,75 @@
-#ifndef ORANGESQL_INDEX_MANAGER_H
-#define ORANGESQL_INDEX_MANAGER_H
+// index/index_manager.h
+#ifndef INDEX_MANAGER_H
+#define INDEX_MANAGER_H
 
 #include "btree.h"
-#include "../metadata/catalog.h"
-#include "../storage/buffer_pool.h"
+#include "btree_concurrent.h"
+#include "../include/types.h"
+#include "../include/status.h"
 #include <unordered_map>
+#include <string>
 #include <memory>
+#include <shared_mutex>
 
 namespace orangesql {
 
-// Metadados do índice
-struct IndexMetadata {
-    IndexId id;
-    std::string name;
-    TableId table_id;
-    std::string table_name;
-    std::vector<std::string> columns;
-    IndexType type;
-    bool unique;
-    bool primary;
-    size_t estimated_size;
-    size_t unique_values;
-    
-    IndexMetadata() : id(0), table_id(0), type(IndexType::BTREE), 
-                     unique(false), primary(false), estimated_size(0), unique_values(0) {}
-};
-
-// Gerenciador de índices
-class IndexManager {
+class Index {
 public:
-    IndexManager(Catalog* catalog, BufferPool* buffer_pool);
-    ~IndexManager();
+    Index(const std::string& name, const std::string& table, 
+          const std::string& column, bool unique);
+    ~Index();
     
-    // Criação e remoção
-    Status createIndex(const std::string& name, const std::string& table,
-                       const std::vector<std::string>& columns,
-                       const IndexConfig& config = IndexConfig());
+    Status insert(const Value& key, uint64_t row_id);
+    Status search(const Value& key, std::vector<uint64_t>& row_ids);
+    Status searchRange(const Value& start, const Value& end, std::vector<uint64_t>& row_ids);
+    Status remove(const Value& key);
+    Status bulkLoad(const std::vector<Row>& rows, const std::vector<uint64_t>& row_ids);
     
-    Status dropIndex(const std::string& name);
-    Status dropIndex(IndexId id);
+    void disable() { enabled_ = false; }
+    void enable() { enabled_ = true; }
+    bool isEnabled() const { return enabled_; }
     
-    // Acesso a índices
-    template<typename K, typename V>
-    BTree<K, V>* getIndex(IndexId id);
+    const std::string& getName() const { return name_; }
+    const std::string& getTable() const { return table_; }
+    const std::string& getColumn() const { return column_; }
+    bool isUnique() const { return unique_; }
     
-    template<typename K, typename V>
-    BTree<K, V>* getIndex(const std::string& name);
-    
-    // Operações de manutenção
-    Status rebuildIndex(IndexId id);
-    Status rebuildAllIndexes();
-    Status vacuumIndex(IndexId id);
-    
-    // Estatísticas
-    IndexMetadata getIndexMetadata(IndexId id) const;
-    std::vector<IndexMetadata> listIndexes() const;
-    std::vector<IndexMetadata> listIndexes(const std::string& table) const;
-    
-    // Cache de índices
-    void clearCache();
-    size_t getCacheSize() const { return index_cache_.size(); }
-    
-    // Validação
-    bool validateIndex(IndexId id);
+    size_t size() const;
     
 private:
-    Catalog* catalog_;
-    BufferPool* buffer_pool_;
+    std::string name_;
+    std::string table_;
+    std::string column_;
+    bool unique_;
+    bool enabled_;
+    std::unique_ptr<ConcurrentBTree<std::string>> btree_;
     
-    // Cache de índices abertos
-    struct IndexEntry {
-        std::unique_ptr<void> index;
-        IndexType type;
-        std::chrono::steady_clock::time_point last_used;
-    };
-    
-    std::unordered_map<IndexId, IndexEntry> index_cache_;
-    std::unordered_map<std::string, IndexId> name_to_id_;
-    
-    // Configurações de cache
-    static constexpr size_t MAX_CACHED_INDEXES = 100;
-    static constexpr size_t CACHE_CLEANUP_INTERVAL = 60; // segundos
-    
-    // Gerenciamento de cache
-    void cacheIndex(IndexId id, std::unique_ptr<void> index, IndexType type);
-    void evictIndex();
-    void cleanupCache();
-    
-    // Helpers
-    std::string getIndexFileName(IndexId id) const;
-    bool loadIndexMetadata(IndexId id, IndexMetadata& metadata);
-    void saveIndexMetadata(const IndexMetadata& metadata);
+    std::string keyToString(const Value& key);
+    Value stringToKey(const std::string& str, DataType type);
 };
 
-} // namespace orangesql
+class IndexManager {
+public:
+    static IndexManager& getInstance();
+    
+    Status createIndex(const std::string& name, const std::string& table,
+                       const std::string& column, bool unique);
+    Status dropIndex(const std::string& name);
+    Index* getIndex(const std::string& name);
+    Index* getIndexOnColumn(const std::string& table, const std::string& column);
+    std::vector<Index*> getIndexesForTable(const std::string& table);
+    
+    Status load();
+    Status persist();
+    
+private:
+    IndexManager() = default;
+    
+    std::unordered_map<std::string, std::unique_ptr<Index>> indexes_;
+    std::unordered_map<std::string, std::vector<std::string>> table_indexes_;
+    std::shared_mutex mutex_;
+};
 
-#endif // ORANGESQL_INDEX_MANAGER_H
+}
+
+#endif

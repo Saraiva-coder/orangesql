@@ -1,237 +1,256 @@
+// transaction/wal.cpp
 #include "wal.h"
+#include "../include/logger.h"
+#include <filesystem>
+#include <chrono>
+
+namespace fs = std::filesystem;
 
 namespace orangesql {
 
-WALManager::WALManager(LogManager* log_manager, BufferPool* buffer_pool)
-    : log_manager_(log_manager), buffer_pool_(buffer_pool) {
+WALManager& WALManager::getInstance() {
+    static WALManager instance;
+    return instance;
 }
+
+WALManager::WALManager() : last_lsn_(0), flushed_lsn_(0), current_segment_(1) {}
 
 WALManager::~WALManager() {
-    flushAll();
+    if (wal_file_.is_open()) {
+        flush();
+        wal_file_.close();
+    }
 }
 
-LogSequenceNumber WALManager::logInsert(TransactionId tx_id, PageId page_id,
-                                        const std::vector<Value>& record, RecordId rid) {
-    auto data = serializeRecord(record);
-    
-    // Adicionar RID aos dados
-    size_t total_len = data.size() + sizeof(rid);
-    std::vector<char> full_data(total_len);
-    memcpy(full_data.data(), &rid, sizeof(rid));
-    memcpy(full_data.data() + sizeof(rid), data.data(), data.size());
-    
-    return log_manager_->appendLogRecord(LogRecordType::INSERT, tx_id, page_id,
-                                        full_data.data(), full_data.size());
+Status WALManager::init(const std::string& wal_dir) {
+    wal_dir_ = wal_dir;
+    fs::create_directories(wal_dir);
+    return openSegment();
 }
 
-LogSequenceNumber WALManager::logUpdate(TransactionId tx_id, PageId page_id,
-                                        const std::vector<Value>& old_record,
-                                        const std::vector<Value>& new_record,
-                                        RecordId rid) {
-    auto old_data = serializeRecord(old_record);
-    auto new_data = serializeRecord(new_record);
-    
-    // Formato: [RID][old_len][old_data][new_len][new_data]
-    size_t total_len = sizeof(rid) + sizeof(size_t) * 2 + 
-                      old_data.size() + new_data.size();
-    std::vector<char> full_data(total_len);
-    
-    char* ptr = full_data.data();
-    memcpy(ptr, &rid, sizeof(rid));
-    ptr += sizeof(rid);
-    
-    size_t old_len = old_data.size();
-    memcpy(ptr, &old_len, sizeof(old_len));
-    ptr += sizeof(old_len);
-    memcpy(ptr, old_data.data(), old_len);
-    ptr += old_len;
-    
-    size_t new_len = new_data.size();
-    memcpy(ptr, &new_len, sizeof(new_len));
-    ptr += sizeof(new_len);
-    memcpy(ptr, new_data.data(), new_len);
-    
-    return log_manager_->appendLogRecord(LogRecordType::UPDATE, tx_id, page_id,
-                                        full_data.data(), full_data.size());
-}
-
-LogSequenceNumber WALManager::logDelete(TransactionId tx_id, PageId page_id,
-                                        const std::vector<Value>& record, RecordId rid) {
-    auto data = serializeRecord(record);
-    
-    // Adicionar RID aos dados
-    size_t total_len = data.size() + sizeof(rid);
-    std::vector<char> full_data(total_len);
-    memcpy(full_data.data(), &rid, sizeof(rid));
-    memcpy(full_data.data() + sizeof(rid), data.data(), data.size());
-    
-    return log_manager_->appendLogRecord(LogRecordType::DELETE, tx_id, page_id,
-                                        full_data.data(), full_data.size());
-}
-
-void WALManager::beforePageWrite(PageId page_id, LogSequenceNumber lsn) {
+Status WALManager::appendRecord(const WALRecord& record) {
     std::lock_guard<std::mutex> lock(mutex_);
     
-    // WAL: log deve estar no disco antes da página
-    log_manager_->flush(lsn);
-    durable_pages_[page_id] = lsn;
+    WALRecord rec = record;
+    rec.lsn = ++last_lsn_;
+    rec.timestamp = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    
+    auto data = rec.serialize();
+    wal_file_.write(data.data(), data.size());
+    wal_file_.flush();
+    
+    flushed_lsn_ = rec.lsn;
+    
+    if (wal_file_.tellp() > WAL_SEGMENT_SIZE) {
+        rotateSegment();
+    }
+    
+    return Status::OK();
 }
 
-bool WALManager::isPageDurable(PageId page_id) const {
+Status WALManager::flush() {
     std::lock_guard<std::mutex> lock(mutex_);
-    return durable_pages_.find(page_id) != durable_pages_.end();
+    if (wal_file_.is_open()) {
+        wal_file_.flush();
+    }
+    return Status::OK();
 }
 
-void WALManager::flush(LogSequenceNumber lsn) {
-    log_manager_->flush(lsn);
-}
-
-void WALManager::flushAll() {
-    log_manager_->flushAll();
-}
-
-Status WALManager::recover() {
-    return log_manager_->recover();
-}
-
-std::vector<char> WALManager::serializeRecord(const std::vector<Value>& record) {
-    // Calcular tamanho total
-    size_t total_size = sizeof(uint16_t); // número de campos
+Status WALManager::truncate(uint64_t lsn) {
+    std::lock_guard<std::mutex> lock(mutex_);
     
-    for (const auto& val : record) {
-        total_size += sizeof(uint8_t); // tipo
-        
-        switch (val.type) {
-            case DataType::INTEGER:
-                total_size += sizeof(int32_t);
-                break;
-            case DataType::BIGINT:
-                total_size += sizeof(int64_t);
-                break;
-            case DataType::BOOLEAN:
-                total_size += sizeof(bool);
-                break;
-            case DataType::VARCHAR:
-                total_size += sizeof(uint32_t) + val.str_val.length();
-                break;
-            default:
-                break;
+    wal_file_.close();
+    
+    uint64_t segment_to_keep = lsn / WAL_SEGMENT_SIZE + 1;
+    
+    for (uint64_t seg = 1; seg < segment_to_keep; seg++) {
+        std::string path = getSegmentPath(seg);
+        if (fs::exists(path)) {
+            fs::remove(path);
         }
     }
     
-    std::vector<char> buffer(total_size);
-    char* ptr = buffer.data();
+    current_segment_ = segment_to_keep;
+    return openSegment();
+}
+
+Status WALManager::openSegment() {
+    if (wal_file_.is_open()) {
+        wal_file_.close();
+    }
     
-    // Número de campos
-    uint16_t count = record.size();
-    memcpy(ptr, &count, sizeof(count));
-    ptr += sizeof(count);
+    std::string path = getSegmentPath(current_segment_);
+    wal_file_.open(path, std::ios::binary | std::ios::app);
     
-    // Campos
-    for (const auto& val : record) {
-        uint8_t type = static_cast<uint8_t>(val.type);
-        memcpy(ptr, &type, sizeof(type));
-        ptr += sizeof(type);
+    if (!wal_file_.is_open()) {
+        return Status::Error("Failed to open WAL segment");
+    }
+    
+    return Status::OK();
+}
+
+Status WALManager::rotateSegment() {
+    flush();
+    current_segment_++;
+    return openSegment();
+}
+
+std::string WALManager::getSegmentPath(uint64_t segment_id) {
+    char buffer[256];
+    snprintf(buffer, sizeof(buffer), "wal_%05lu.log", segment_id);
+    return (fs::path(wal_dir_) / buffer).string();
+}
+
+Status WALManager::readSegment(uint64_t segment_id, std::vector<WALRecord>& records) {
+    std::string path = getSegmentPath(segment_id);
+    std::ifstream file(path, std::ios::binary);
+    
+    if (!file.is_open()) {
+        return Status::OK();
+    }
+    
+    while (file.peek() != EOF) {
+        uint32_t record_size;
+        file.read(reinterpret_cast<char*>(&record_size), sizeof(uint32_t));
         
-        switch (val.type) {
-            case DataType::INTEGER:
-                memcpy(ptr, &val.data.int_val, sizeof(int32_t));
-                ptr += sizeof(int32_t);
-                break;
-                
-            case DataType::BIGINT:
-                memcpy(ptr, &val.data.bigint_val, sizeof(int64_t));
-                ptr += sizeof(int64_t);
-                break;
-                
-            case DataType::BOOLEAN:
-                memcpy(ptr, &val.data.bool_val, sizeof(bool));
-                ptr += sizeof(bool);
-                break;
-                
-            case DataType::VARCHAR: {
-                uint32_t len = val.str_val.length();
-                memcpy(ptr, &len, sizeof(len));
-                ptr += sizeof(len);
-                memcpy(ptr, val.str_val.c_str(), len);
-                ptr += len;
-                break;
+        if (file.gcount() != sizeof(uint32_t)) break;
+        
+        std::vector<char> data(record_size);
+        file.read(data.data(), record_size);
+        
+        if (file.gcount() != record_size) break;
+        
+        records.push_back(WALRecord::deserialize(data));
+    }
+    
+    return Status::OK();
+}
+
+Status WALManager::recover(std::function<Status(const WALRecord&)> replay_func) {
+    uint64_t segment_id = 1;
+    std::vector<WALRecord> records;
+    
+    while (true) {
+        std::vector<WALRecord> seg_records;
+        Status status = readSegment(segment_id, seg_records);
+        if (!status.ok() || seg_records.empty()) break;
+        
+        records.insert(records.end(), seg_records.begin(), seg_records.end());
+        segment_id++;
+    }
+    
+    std::unordered_map<uint64_t, std::vector<WALRecord>> txn_records;
+    
+    for (const auto& record : records) {
+        if (record.type == WALRecordType::BEGIN ||
+            record.type == WALRecordType::INSERT ||
+            record.type == WALRecordType::UPDATE ||
+            record.type == WALRecordType::DELETE) {
+            txn_records[record.transaction_id].push_back(record);
+        } else if (record.type == WALRecordType::COMMIT) {
+            for (const auto& rec : txn_records[record.transaction_id]) {
+                Status s = replay_func(rec);
+                if (!s.ok()) return s;
             }
-            
-            default:
-                break;
+            txn_records.erase(record.transaction_id);
         }
     }
     
-    return buffer;
+    return Status::OK();
 }
 
-std::vector<Value> WALManager::deserializeRecord(const char* data, size_t len) {
-    std::vector<Value> result;
-    const char* ptr = data;
-    const char* end = data + len;
+std::vector<char> WALRecord::serialize() const {
+    std::vector<char> data;
     
-    // Número de campos
-    if (ptr + sizeof(uint16_t) > end) return result;
-    uint16_t count;
-    memcpy(&count, ptr, sizeof(count));
-    ptr += sizeof(count);
+    uint32_t type_val = static_cast<uint32_t>(type);
+    data.insert(data.end(), reinterpret_cast<const char*>(&type_val), 
+                reinterpret_cast<const char*>(&type_val) + sizeof(uint32_t));
     
-    // Campos
-    for (uint16_t i = 0; i < count && ptr < end; i++) {
-        if (ptr + sizeof(uint8_t) > end) break;
-        
-        uint8_t type_byte;
-        memcpy(&type_byte, ptr, sizeof(type_byte));
-        ptr += sizeof(type_byte);
-        
-        DataType type = static_cast<DataType>(type_byte);
-        Value val;
-        val.type = type;
-        
-        switch (type) {
-            case DataType::INTEGER:
-                if (ptr + sizeof(int32_t) <= end) {
-                    memcpy(&val.data.int_val, ptr, sizeof(int32_t));
-                    ptr += sizeof(int32_t);
-                }
-                break;
-                
-            case DataType::BIGINT:
-                if (ptr + sizeof(int64_t) <= end) {
-                    memcpy(&val.data.bigint_val, ptr, sizeof(int64_t));
-                    ptr += sizeof(int64_t);
-                }
-                break;
-                
-            case DataType::BOOLEAN:
-                if (ptr + sizeof(bool) <= end) {
-                    memcpy(&val.data.bool_val, ptr, sizeof(bool));
-                    ptr += sizeof(bool);
-                }
-                break;
-                
-            case DataType::VARCHAR: {
-                if (ptr + sizeof(uint32_t) > end) break;
-                uint32_t str_len;
-                memcpy(&str_len, ptr, sizeof(str_len));
-                ptr += sizeof(str_len);
-                
-                if (ptr + str_len <= end) {
-                    val.str_val.assign(ptr, str_len);
-                    ptr += str_len;
-                }
-                break;
-            }
-            
-            default:
-                break;
-        }
-        
-        result.push_back(val);
-    }
+    data.insert(data.end(), reinterpret_cast<const char*>(&lsn), 
+                reinterpret_cast<const char*>(&lsn) + sizeof(uint64_t));
+    data.insert(data.end(), reinterpret_cast<const char*>(&transaction_id), 
+                reinterpret_cast<const char*>(&transaction_id) + sizeof(uint64_t));
+    data.insert(data.end(), reinterpret_cast<const char*>(&timestamp), 
+                reinterpret_cast<const char*>(&timestamp) + sizeof(uint64_t));
+    data.insert(data.end(), reinterpret_cast<const char*>(&page_id), 
+                reinterpret_cast<const char*>(&page_id) + sizeof(uint32_t));
+    data.insert(data.end(), reinterpret_cast<const char*>(&offset), 
+                reinterpret_cast<const char*>(&offset) + sizeof(uint32_t));
     
-    return result;
+    uint32_t old_size = old_data.size();
+    data.insert(data.end(), reinterpret_cast<const char*>(&old_size), 
+                reinterpret_cast<const char*>(&old_size) + sizeof(uint32_t));
+    data.insert(data.end(), old_data.begin(), old_data.end());
+    
+    uint32_t new_size = new_data.size();
+    data.insert(data.end(), reinterpret_cast<const char*>(&new_size), 
+                reinterpret_cast<const char*>(&new_size) + sizeof(uint32_t));
+    data.insert(data.end(), new_data.begin(), new_data.end());
+    
+    uint32_t table_len = table_name.size();
+    data.insert(data.end(), reinterpret_cast<const char*>(&table_len), 
+                reinterpret_cast<const char*>(&table_len) + sizeof(uint32_t));
+    data.insert(data.end(), table_name.begin(), table_name.end());
+    
+    data.insert(data.end(), reinterpret_cast<const char*>(&prev_lsn), 
+                reinterpret_cast<const char*>(&prev_lsn) + sizeof(uint64_t));
+    
+    uint32_t total_size = data.size();
+    data.insert(data.begin(), reinterpret_cast<const char*>(&total_size), 
+                reinterpret_cast<const char*>(&total_size) + sizeof(uint32_t));
+    
+    return data;
 }
 
-} // namespace orangesql
+WALRecord WALRecord::deserialize(const std::vector<char>& data) {
+    WALRecord record;
+    size_t pos = 0;
+    
+    uint32_t type_val;
+    memcpy(&type_val, data.data() + pos, sizeof(uint32_t));
+    record.type = static_cast<WALRecordType>(type_val);
+    pos += sizeof(uint32_t);
+    
+    memcpy(&record.lsn, data.data() + pos, sizeof(uint64_t));
+    pos += sizeof(uint64_t);
+    memcpy(&record.transaction_id, data.data() + pos, sizeof(uint64_t));
+    pos += sizeof(uint64_t);
+    memcpy(&record.timestamp, data.data() + pos, sizeof(uint64_t));
+    pos += sizeof(uint64_t);
+    memcpy(&record.page_id, data.data() + pos, sizeof(uint32_t));
+    pos += sizeof(uint32_t);
+    memcpy(&record.offset, data.data() + pos, sizeof(uint32_t));
+    pos += sizeof(uint32_t);
+    
+    uint32_t old_size;
+    memcpy(&old_size, data.data() + pos, sizeof(uint32_t));
+    pos += sizeof(uint32_t);
+    record.old_data.resize(old_size);
+    memcpy(record.old_data.data(), data.data() + pos, old_size);
+    pos += old_size;
+    
+    uint32_t new_size;
+    memcpy(&new_size, data.data() + pos, sizeof(uint32_t));
+    pos += sizeof(uint32_t);
+    record.new_data.resize(new_size);
+    memcpy(record.new_data.data(), data.data() + pos, new_size);
+    pos += new_size;
+    
+    uint32_t table_len;
+    memcpy(&table_len, data.data() + pos, sizeof(uint32_t));
+    pos += sizeof(uint32_t);
+    record.table_name.assign(data.data() + pos, table_len);
+    pos += table_len;
+    
+    memcpy(&record.prev_lsn, data.data() + pos, sizeof(uint64_t));
+    
+    return record;
+}
+
+size_t WALRecord::getSize() const {
+    return sizeof(uint32_t) * 5 + sizeof(uint64_t) * 5 + 
+           old_data.size() + new_data.size() + table_name.size();
+}
+
+}

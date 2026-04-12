@@ -1,6 +1,46 @@
-echo node_modules/ >> .gitignore
-echo .env >> .gitignore
-echo dist/ >> .gitignore
-echo build/ >> .gitignore
-echo __pycache__/ >> .gitignore
-echo venv/ >> .gitignore
+// .gitignore
+# Build directories
+build/
+cmake-build-*/
+out/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Data directories
+data/
+*.db
+*.idx
+*.log
+*.wal
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+
+# Profiling
+*.gcda
+*.gcno
+*.gcov
+profile/
+
+# Logs
+*.log
+orangesql.log
+
+# OS files
+Thumbs.db
+ehthumbs.db
+Desktop.ini

@@ -1,184 +1,82 @@
-#ifndef ORANGESQL_STATISTICS_H
-#define ORANGESQL_STATISTICS_H
+// metadata/statistics.h
+#ifndef STATISTICS_H
+#define STATISTICS_H
 
 #include "../include/types.h"
-#include "catalog.h"
+#include "../include/status.h"
+#include <string>
 #include <vector>
 #include <unordered_map>
-#include <random>
+#include <atomic>
 
 namespace orangesql {
 
-// Histograma para uma coluna
-struct Histogram {
-    struct Bucket {
-        Value min;
-        Value max;
-        size_t count;
-        double distinct_ratio;
-        
-        Bucket() : count(0), distinct_ratio(0) {}
-    };
-    
+struct ColumnStats {
     std::string column_name;
-    std::vector<Bucket> buckets;
-    size_t total_count;
-    size_t distinct_count;
-    Value min_value;
-    Value max_value;
-    
-    Histogram() : total_count(0), distinct_count(0) {}
-    
-    // Estimar seletividade para uma condição
-    double estimateSelectivity(const ASTNode* condition) const;
-    
-    // Valor na posição do percentil
-    Value getPercentile(double p) const;
-};
-
-// Estatísticas de uma coluna
-struct ColumnStatistics {
-    std::string column_name;
-    DataType type;
-    
-    size_t distinct_values;
     size_t null_count;
-    Value min_value;
-    Value max_value;
-    double avg_length;
+    size_t distinct_count;
+    size_t total_count;
+    double min_value;
+    double max_value;
+    double avg_value;
+    std::vector<std::pair<std::string, size_t>> histogram;
     
-    // Correlação com outras colunas
-    std::unordered_map<std::string, double> correlations;
+    ColumnStats() : null_count(0), distinct_count(0), total_count(0),
+                    min_value(0), max_value(0), avg_value(0) {}
     
-    // Histograma (se aplicável)
-    std::unique_ptr<Histogram> histogram;
-    
-    ColumnStatistics() : distinct_values(0), null_count(0), avg_length(0) {}
+    double getSelectivity() const {
+        if (total_count == 0) return 1.0;
+        return static_cast<double>(distinct_count) / static_cast<double>(total_count);
+    }
 };
 
-// Estatísticas de uma tabela
-struct TableStatistics {
+struct TableStats {
     std::string table_name;
-    TableId table_id;
-    
     size_t row_count;
     size_t page_count;
     size_t avg_row_size;
+    size_t total_size;
+    std::unordered_map<std::string, ColumnStats> column_stats;
+    std::chrono::system_clock::time_point last_updated;
     
-    std::unordered_map<std::string, ColumnStatistics> columns;
-    
-    // Estatísticas de índices
-    struct IndexStats {
-        std::string index_name;
-        size_t distinct_keys;
-        size_t leaf_pages;
-        size_t height;
-    };
-    std::unordered_map<std::string, IndexStats> indexes;
-    
-    // Metadados de atualização
-    std::chrono::system_clock::time_point last_analyzed;
-    size_t analyze_count;
-    
-    TableStatistics() : row_count(0), page_count(0), avg_row_size(0), analyze_count(0) {}
-    
-    // Atualizar estatísticas
-    void update(const std::vector<std::vector<Value>>& sample);
-    
-    // Estimar seletividade
-    double estimateSelectivity(const std::string& column, 
-                               const Value& value,
-                               Operator op) const;
-    
-    double estimateJoinSelectivity(const std::string& col1,
-                                   const std::string& col2,
-                                   const TableStatistics& other) const;
-    
-    // Cardinalidade
-    size_t estimateCardinality(const std::string& column) const;
-    
-    // Amostragem
-    std::vector<Value> sampleColumn(const std::string& column, size_t sample_size) const;
+    TableStats() : row_count(0), page_count(0), avg_row_size(0), total_size(0) {}
 };
 
-// Gerenciador de estatísticas
 class StatisticsManager {
 public:
-    StatisticsManager(Catalog* catalog);
+    static StatisticsManager& getInstance();
+    
+    Status updateTableStats(const std::string& table_name);
+    Status updateColumnStats(const std::string& table_name, const std::string& column_name);
+    Status updateAllStats();
+    
+    TableStats* getTableStats(const std::string& table_name);
+    ColumnStats* getColumnStats(const std::string& table_name, const std::string& column_name);
+    
+    double estimateCardinality(const std::string& table_name, const std::string& column_name,
+                               const std::string& value);
+    double estimateSelectivity(const std::string& table_name, const std::string& column_name,
+                               const std::string& op, const std::string& value);
+    
+    void enableAutoUpdate(bool enable);
+    void setSampleRate(double rate);
+    
+    Status persist();
+    Status load();
+    
+private:
+    StatisticsManager();
     ~StatisticsManager();
     
-    // Análise de tabelas
-    Status analyzeTable(const std::string& table_name, size_t sample_size = 10000);
-    Status analyzeDatabase();
+    std::unordered_map<std::string, TableStats> stats_;
+    std::shared_mutex mutex_;
+    std::atomic<bool> auto_update_{true};
+    std::atomic<double> sample_rate_{0.1};
     
-    // Consulta de estatísticas
-    const TableStatistics* getTableStats(const std::string& table_name) const;
-    const ColumnStatistics* getColumnStats(const std::string& table_name,
-                                           const std::string& column_name) const;
-    
-    // Estimativas de custo
-    double estimateTableSize(const std::string& table_name) const;
-    size_t estimateRowCount(const std::string& table_name) const;
-    
-    // Atualização incremental
-    void updateAfterInsert(const std::string& table_name, 
-                           const std::vector<Value>& row);
-    void updateAfterDelete(const std::string& table_name,
-                           const std::vector<Value>& row);
-    void updateAfterUpdate(const std::string& table_name,
-                           const std::vector<Value>& old_row,
-                           const std::vector<Value>& new_row);
-    
-    // Persistência
-    Status load();
-    Status save();
-    
-    // Configuração
-    void setAutoAnalyze(bool enabled) { auto_analyze_ = enabled; }
-    void setAnalyzeThreshold(size_t rows) { analyze_threshold_ = rows; }
-    
-    // Estatísticas do gerenciador
-    struct ManagerStats {
-        size_t tables_analyzed;
-        size_t total_samples;
-        double avg_analyze_time_ms;
-        
-        ManagerStats() : tables_analyzed(0), total_samples(0), avg_analyze_time_ms(0) {}
-    };
-    
-    const ManagerStats& getStats() const { return stats_; }
-
-private:
-    Catalog* catalog_;
-    std::unordered_map<std::string, TableStatistics> statistics_;
-    
-    bool auto_analyze_;
-    size_t analyze_threshold_;
-    std::chrono::steady_clock::time_point last_auto_analyze_;
-    
-    ManagerStats stats_;
-    mutable std::shared_mutex mutex_;
-    
-    // Coleta de amostras
-    std::vector<std::vector<Value>> collectSample(const std::string& table_name,
-                                                   size_t sample_size);
-    
-    // Cálculo de histogramas
-    std::unique_ptr<Histogram> buildHistogram(const std::vector<Value>& sample,
-                                              const std::string& column,
-                                              size_t num_buckets = 100);
-    
-    // Correlações
-    double calculateCorrelation(const std::vector<Value>& col1,
-                                const std::vector<Value>& col2);
-    
-    // Validação
-    bool needsAnalyze(const std::string& table_name) const;
-    
-    // Limpeza
-    void expireOldStats();
+    void computeHistogram(ColumnStats& stats, const std::vector<Value>& values);
+    void mergeStats(TableStats& target, const TableStats& source);
 };
 
-} // namespace orangesql
+}
 
-#endif // ORANGESQL_STATISTICS_H
+#endif

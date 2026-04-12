@@ -1,388 +1,351 @@
+// storage/table.cpp
 #include "table.h"
+#include "../include/logger.h"
+#include "../include/config.h"
+#include <cstring>
 #include <algorithm>
+#include <fstream>
+#include <nlohmann/json.hpp>
 
 namespace orangesql {
 
-Table::Table(const TableSchema& schema, BufferPool* buffer_pool)
-    : schema_(schema)
-    , buffer_pool_(buffer_pool)
-    , first_page_(nullptr)
-    , last_page_(nullptr)
-    , cached_record_count_(0)
-    , cached_page_count_(0) {
+Table::Table(const std::string& name, const std::vector<Column>& schema)
+    : name_(name), schema_(schema), next_page_id_(1), row_count_(0) {
     
-    // Carregar primeira página
-    first_page_ = buffer_pool_->fetchPage(schema_.id, 0);
-    if (!first_page_) {
-        // Criar primeira página
-        first_page_ = buffer_pool_->createNewPage(schema_.id);
-        last_page_ = first_page_;
-    } else {
-        // Encontrar última página
-        Page* page = first_page_;
-        while (page->getNextPage() != INVALID_PAGE_ID) {
-            page = buffer_pool_->fetchPage(schema_.id, page->getNextPage());
-        }
-        last_page_ = page;
+    for (size_t i = 0; i < schema_.size(); i++) {
+        column_index_[schema_[i].name] = static_cast<int>(i);
     }
+    
+    buffer_pool_ = new BufferPool(Config::getInstance().getBufferPoolSize());
+    
+    std::string filename = name + ".data";
+    Status status = file_manager_.openFile(filename, file_id_);
+    if (!status.ok()) {
+        LOG_ERROR("Failed to open table file: " + filename);
+    }
+    
+    loadMetadata();
 }
 
-Status Table::insertRecord(const std::vector<Value>& values, RecordId& rid) {
-    // Validar valores
-    if (!validateRecord(values)) {
-        return Status::ERROR;
-    }
-    
-    // Tentar inserir na última página
-    if (last_page_->insertRecord(values, rid)) {
-        buffer_pool_->unpinPage(last_page_->getPageId(), true);
-        cached_record_count_++;
-        return Status::OK;
-    }
-    
-    // Página cheia, criar nova
-    Page* new_page = appendNewPage();
-    if (!new_page) {
-        return Status::ERROR;
-    }
-    
-    // Inserir na nova página
-    if (!new_page->insertRecord(values, rid)) {
-        return Status::ERROR;
-    }
-    
-    cached_record_count_++;
-    return Status::OK;
+Table::~Table() {
+    saveMetadata();
+    file_manager_.closeFile(file_id_);
+    delete buffer_pool_;
 }
 
-Status Table::getRecord(RecordId rid, std::vector<Value>& values) {
-    PageId page_id = rid >> 32;
-    Page* page = getPage(page_id);
+Status Table::insertRow(Row& row) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     
-    if (!page || !page->getRecord(rid, values)) {
-        return Status::NOT_FOUND;
-    }
+    std::vector<char> data;
+    Status status = serializeRow(row, data);
+    if (!status.ok()) return status;
     
-    return Status::OK;
-}
-
-Status Table::updateRecord(RecordId rid, const std::vector<Value>& values) {
-    // Validar valores
-    if (!validateRecord(values)) {
-        return Status::ERROR;
-    }
+    uint32_t page_id = next_page_id_;
+    Page* page = buffer_pool_->getPage(file_id_, page_id);
     
-    PageId page_id = rid >> 32;
-    Page* page = getPage(page_id);
-    
-    if (!page || !page->updateRecord(rid, values)) {
-        return Status::NOT_FOUND;
-    }
-    
-    return Status::OK;
-}
-
-Status Table::deleteRecord(RecordId rid) {
-    PageId page_id = rid >> 32;
-    Page* page = getPage(page_id);
-    
-    if (!page || !page->deleteRecord(rid)) {
-        return Status::NOT_FOUND;
-    }
-    
-    cached_record_count_--;
-    return Status::OK;
-}
-
-size_t Table::insertRecords(const std::vector<std::vector<Value>>& records, 
-                            std::vector<RecordId>& rids) {
-    size_t inserted = 0;
-    for (const auto& record : records) {
-        RecordId rid;
-        if (insertRecord(record, rid) == Status::OK) {
-            rids.push_back(rid);
-            inserted++;
-        } else {
-            break;
+    if (!page) {
+        page_id = ++next_page_id_;
+        page = buffer_pool_->getPage(file_id_, page_id);
+        if (!page) {
+            return Status::Error("Failed to allocate page");
         }
     }
-    return inserted;
-}
-
-size_t Table::deleteRecords(const std::vector<RecordId>& rids) {
-    size_t deleted = 0;
-    for (auto rid : rids) {
-        if (deleteRecord(rid) == Status::OK) {
-            deleted++;
+    
+    uint32_t offset;
+    status = page->insertRecord(data, offset);
+    
+    if (!status.ok()) {
+        page_id = ++next_page_id_;
+        page = buffer_pool_->getPage(file_id_, page_id);
+        if (!page) {
+            return Status::Error("Failed to allocate new page");
+        }
+        status = page->insertRecord(data, offset);
+        if (!status.ok()) {
+            buffer_pool_->unpinPage(page);
+            return status;
         }
     }
-    return deleted;
+    
+    row.row_id = generateRowId(page_id, offset);
+    row_count_++;
+    
+    buffer_pool_->markDirty(page);
+    buffer_pool_->unpinPage(page);
+    
+    return Status::OK();
 }
 
-TableIterator Table::begin() {
-    return TableIterator(this, first_page_->getPageId(), 0);
+Status Table::getRow(uint64_t row_id, Row& row) {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    
+    uint32_t page_id, offset;
+    parseRowId(row_id, page_id, offset);
+    
+    Page* page = buffer_pool_->getPage(file_id_, page_id);
+    if (!page) {
+        return Status::NotFound("Page not found");
+    }
+    
+    std::vector<char> data;
+    Status status = page->getRecord(offset, data);
+    
+    if (status.ok()) {
+        status = deserializeRow(data, row);
+        row.row_id = row_id;
+    }
+    
+    buffer_pool_->unpinPage(page);
+    return status;
 }
 
-TableIterator Table::end() {
-    return TableIterator(this, INVALID_PAGE_ID, 0);
+Status Table::updateRow(uint64_t row_id, const Row& row) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    
+    uint32_t page_id, offset;
+    parseRowId(row_id, page_id, offset);
+    
+    Page* page = buffer_pool_->getPage(file_id_, page_id);
+    if (!page) {
+        return Status::NotFound("Page not found");
+    }
+    
+    std::vector<char> data;
+    Status status = serializeRow(row, data);
+    
+    if (status.ok()) {
+        status = page->updateRecord(offset, data);
+        if (status.ok()) {
+            buffer_pool_->markDirty(page);
+        }
+    }
+    
+    buffer_pool_->unpinPage(page);
+    return status;
 }
 
-TableIterator Table::find(const std::vector<Value>& key) {
-    // Busca linear - será substituída por índice
-    for (auto it = begin(); it != end(); ++it) {
-        auto [rid, values] = *it;
+Status Table::deleteRow(uint64_t row_id) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    
+    uint32_t page_id, offset;
+    parseRowId(row_id, page_id, offset);
+    
+    Page* page = buffer_pool_->getPage(file_id_, page_id);
+    if (!page) {
+        return Status::NotFound("Page not found");
+    }
+    
+    Status status = page->deleteRecord(offset);
+    if (status.ok()) {
+        buffer_pool_->markDirty(page);
+        row_count_--;
+    }
+    
+    buffer_pool_->unpinPage(page);
+    return status;
+}
+
+Status Table::getAllRowIds(std::vector<uint64_t>& row_ids) {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    
+    row_ids.clear();
+    row_ids.reserve(row_count_);
+    
+    for (uint32_t page_id = 1; page_id <= next_page_id_; page_id++) {
+        Page* page = buffer_pool_->getPage(file_id_, page_id);
+        if (!page) continue;
         
-        // Comparar com a chave (primeira coluna por enquanto)
-        if (values.size() > 0 && values[0].data.int_val == key[0].data.int_val) {
-            return it;
+        uint32_t offset = sizeof(PageHeader);
+        uint32_t end = page->getFreeSpace();
+        
+        while (offset < end) {
+            uint32_t record_size;
+            memcpy(&record_size, reinterpret_cast<const char*>(page->getData()) + offset, sizeof(uint32_t));
+            
+            if (record_size > 0 && record_size < PAGE_SIZE) {
+                row_ids.push_back(generateRowId(page_id, offset));
+            }
+            
+            offset += sizeof(uint32_t) + record_size;
         }
+        
+        buffer_pool_->unpinPage(page);
     }
     
-    return end();
+    return Status::OK();
 }
 
-std::vector<std::vector<Value>> Table::scan(const ScanOptions& options) {
-    std::vector<std::vector<Value>> results;
+Status Table::serializeRow(const Row& row, std::vector<char>& data) {
+    data.clear();
     
-    for (auto it = begin(); it != end(); ++it) {
-        auto [rid, values] = *it;
-        results.push_back(values);
+    for (size_t i = 0; i < schema_.size() && i < row.values.size(); i++) {
+        const Value& value = row.values[i];
         
-        if (options.limit > 0 && results.size() >= options.limit) {
-            break;
+        switch (schema_[i].type) {
+            case DataType::INTEGER:
+            case DataType::BIGINT: {
+                int64_t val = value.int_val;
+                data.insert(data.end(), reinterpret_cast<char*>(&val), 
+                           reinterpret_cast<char*>(&val) + sizeof(int64_t));
+                break;
+            }
+            case DataType::FLOAT:
+            case DataType::DOUBLE: {
+                double val = value.double_val;
+                data.insert(data.end(), reinterpret_cast<char*>(&val),
+                           reinterpret_cast<char*>(&val) + sizeof(double));
+                break;
+            }
+            case DataType::BOOLEAN: {
+                char val = value.bool_val ? 1 : 0;
+                data.push_back(val);
+                break;
+            }
+            case DataType::TEXT:
+            case DataType::VARCHAR: {
+                uint32_t len = static_cast<uint32_t>(value.str_val.length());
+                data.insert(data.end(), reinterpret_cast<char*>(&len),
+                           reinterpret_cast<char*>(&len) + sizeof(uint32_t));
+                data.insert(data.end(), value.str_val.begin(), value.str_val.end());
+                break;
+            }
+            default:
+                break;
         }
     }
     
-    // Ordenar se necessário
-    if (!options.order_by.empty()) {
-        std::sort(results.begin(), results.end(),
-            [this, &options](const std::vector<Value>& a, const std::vector<Value>& b) {
-                for (const auto& [col, asc] : options.order_by) {
-                    size_t idx = getColumnIndex(col);
-                    if (idx >= a.size() || idx >= b.size()) continue;
-                    
-                    // Comparação simples (apenas inteiros por enquanto)
-                    if (a[idx].data.int_val < b[idx].data.int_val) return asc;
-                    if (a[idx].data.int_val > b[idx].data.int_val) return !asc;
+    return Status::OK();
+}
+
+Status Table::deserializeRow(const std::vector<char>& data, Row& row) {
+    size_t pos = 0;
+    row.values.clear();
+    
+    for (const auto& column : schema_) {
+        Value value;
+        value.type = column.type;
+        
+        switch (column.type) {
+            case DataType::INTEGER:
+            case DataType::BIGINT: {
+                if (pos + sizeof(int64_t) > data.size()) {
+                    return Status::Error("Corrupt data");
                 }
-                return false;
-            });
-    }
-    
-    return results;
-}
-
-size_t Table::getRecordCount() {
-    // Se cache expirou, recalcular
-    auto now = std::chrono::steady_clock::now();
-    if (now - stats_update_time_ > std::chrono::seconds(5)) {
-        cached_record_count_ = 0;
-        
-        for (auto it = begin(); it != end(); ++it) {
-            cached_record_count_++;
+                memcpy(&value.int_val, data.data() + pos, sizeof(int64_t));
+                pos += sizeof(int64_t);
+                break;
+            }
+            case DataType::FLOAT:
+            case DataType::DOUBLE: {
+                if (pos + sizeof(double) > data.size()) {
+                    return Status::Error("Corrupt data");
+                }
+                memcpy(&value.double_val, data.data() + pos, sizeof(double));
+                pos += sizeof(double);
+                break;
+            }
+            case DataType::BOOLEAN: {
+                if (pos >= data.size()) {
+                    return Status::Error("Corrupt data");
+                }
+                value.bool_val = (data[pos] != 0);
+                pos++;
+                break;
+            }
+            case DataType::TEXT:
+            case DataType::VARCHAR: {
+                if (pos + sizeof(uint32_t) > data.size()) {
+                    return Status::Error("Corrupt data");
+                }
+                uint32_t len;
+                memcpy(&len, data.data() + pos, sizeof(uint32_t));
+                pos += sizeof(uint32_t);
+                
+                if (pos + len > data.size()) {
+                    return Status::Error("Corrupt data");
+                }
+                value.str_val.assign(data.data() + pos, len);
+                pos += len;
+                break;
+            }
+            default:
+                break;
         }
         
-        stats_update_time_ = now;
+        row.values.push_back(value);
     }
     
-    return cached_record_count_;
+    return Status::OK();
 }
 
-size_t Table::getPageCount() {
-    size_t count = 0;
-    Page* page = first_page_;
-    
-    while (page) {
-        count++;
-        page = getPage(page->getNextPage());
-    }
-    
-    return count;
-}
-
-bool Table::validateRecord(const std::vector<Value>& values) const {
-    if (values.size() != schema_.columns.size()) {
-        return false;
-    }
-    
-    for (size_t i = 0; i < values.size(); i++) {
-        if (!validateColumn(i, values[i])) {
-            return false;
-        }
-    }
-    
-    return true;
-}
-
-bool Table::validateColumn(size_t col_idx, const Value& value) const {
-    if (col_idx >= schema_.columns.size()) {
-        return false;
-    }
-    
-    const auto& col = schema_.columns[col_idx];
-    
-    // Verificar tipo
-    if (value.type != col.type) {
-        return false;
-    }
-    
-    // Verificar nullabilidade
-    if (!col.nullable && value.type == DataType::INTEGER && 
-        value.data.int_val == 0 && value.str_val.empty()) {
-        // TODO: Melhor verificação de NULL
-        return false;
-    }
-    
-    return true;
-}
-
-size_t Table::getColumnIndex(const std::string& name) const {
-    for (size_t i = 0; i < schema_.columns.size(); i++) {
-        if (schema_.columns[i].name == name) {
-            return i;
-        }
+int Table::getColumnIndex(const std::string& name) const {
+    auto it = column_index_.find(name);
+    if (it != column_index_.end()) {
+        return it->second;
     }
     return -1;
 }
 
-DataType Table::getColumnType(size_t idx) const {
-    if (idx < schema_.columns.size()) {
-        return schema_.columns[idx].type;
-    }
-    return DataType::INTEGER;
+bool Table::hasIndexOnColumn(const std::string& column) const {
+    return indexed_columns_.find(column) != indexed_columns_.end();
 }
 
-Page* Table::getPage(PageId page_id) {
-    return buffer_pool_->fetchPage(schema_.id, page_id);
+void Table::addIndex(const std::string& column) {
+    indexed_columns_.insert(column);
 }
 
-Page* Table::getOrCreateFirstPage() {
-    if (!first_page_) {
-        first_page_ = buffer_pool_->createNewPage(schema_.id);
-    }
-    return first_page_;
+uint64_t Table::generateRowId(uint32_t page_id, uint32_t offset) {
+    return (static_cast<uint64_t>(page_id) << 32) | offset;
 }
 
-Page* Table::appendNewPage() {
-    Page* new_page = buffer_pool_->createNewPage(schema_.id);
-    
-    if (new_page) {
-        // Linkar com a última página
-        if (last_page_) {
-            last_page_->setNextPage(new_page->getPageId());
-            buffer_pool_->unpinPage(last_page_->getPageId(), true);
-        }
-        
-        new_page->setPrevPage(last_page_ ? last_page_->getPageId() : INVALID_PAGE_ID);
-        last_page_ = new_page;
-        
-        if (!first_page_) {
-            first_page_ = new_page;
-        }
+void Table::parseRowId(uint64_t row_id, uint32_t& page_id, uint32_t& offset) {
+    page_id = static_cast<uint32_t>(row_id >> 32);
+    offset = static_cast<uint32_t>(row_id & 0xFFFFFFFF);
+}
+
+Status Table::loadMetadata() {
+    std::string filename = name_ + ".schema";
+    if (!file_manager_.fileExists(filename)) {
+        return Status::OK();
     }
     
-    return new_page;
-}
-
-void Table::dump() const {
-    std::cout << "Table " << schema_.name << ":\n";
-    std::cout << "  ID: " << schema_.id << "\n";
-    std::cout << "  Columns: " << schema_.columns.size() << "\n";
-    for (const auto& col : schema_.columns) {
-        std::cout << "    " << col.name << ": " 
-                  << static_cast<int>(col.type) << "\n";
+    std::ifstream file("data/tables/" + filename);
+    if (!file.is_open()) {
+        return Status::OK();
     }
     
-    // Contar registros
-    size_t count = 0;
-    for (auto it = const_cast<Table*>(this)->begin(); 
-         it != const_cast<Table*>(this)->end(); ++it) {
-        count++;
-    }
-    std::cout << "  Records: " << count << "\n";
-}
-
-// ============================================
-// TableIterator
-// ============================================
-
-TableIterator::TableIterator(Table* table, PageId page_id, uint16_t slot)
-    : table_(table)
-    , current_page_id_(page_id)
-    , current_slot_(slot)
-    , current_page_(nullptr) {
+    nlohmann::json json;
+    file >> json;
     
-    if (page_id != INVALID_PAGE_ID) {
-        loadCurrentPage();
-        if (current_page_ && current_slot_ >= current_page_->getRecordCount()) {
-            advanceToNextValid();
+    if (json.contains("next_page_id")) {
+        next_page_id_ = json["next_page_id"];
+    }
+    if (json.contains("row_count")) {
+        row_count_ = json["row_count"];
+    }
+    if (json.contains("indexed_columns")) {
+        for (const auto& col : json["indexed_columns"]) {
+            indexed_columns_.insert(col);
         }
-    }
-}
-
-TableIterator& TableIterator::operator++() {
-    if (current_page_id_ != INVALID_PAGE_ID) {
-        current_slot_++;
-        advanceToNextValid();
-    }
-    return *this;
-}
-
-TableIterator TableIterator::operator++(int) {
-    TableIterator tmp = *this;
-    ++(*this);
-    return tmp;
-}
-
-bool TableIterator::operator==(const TableIterator& other) const {
-    return current_page_id_ == other.current_page_id_ && 
-           current_slot_ == other.current_slot_;
-}
-
-bool TableIterator::operator!=(const TableIterator& other) const {
-    return !(*this == other);
-}
-
-std::pair<RecordId, std::vector<Value>> TableIterator::operator*() const {
-    RecordId rid = (static_cast<RecordId>(current_page_id_) << 32) | current_slot_;
-    std::vector<Value> values;
-    
-    if (current_page_) {
-        current_page_->getRecord(rid, values);
     }
     
-    return {rid, values};
+    return Status::OK();
 }
 
-RecordId TableIterator::getRecordId() const {
-    return (static_cast<RecordId>(current_page_id_) << 32) | current_slot_;
-}
-
-void TableIterator::advanceToNextValid() {
-    while (current_page_id_ != INVALID_PAGE_ID) {
-        if (current_page_ && current_slot_ < current_page_->getRecordCount()) {
-            return;
-        }
-        
-        // Avançar para próxima página
-        if (current_page_) {
-            current_page_id_ = current_page_->getNextPage();
-        } else {
-            current_page_id_ = INVALID_PAGE_ID;
-        }
-        
-        if (current_page_id_ != INVALID_PAGE_ID) {
-            loadCurrentPage();
-            current_slot_ = 0;
-        }
+Status Table::saveMetadata() {
+    nlohmann::json json;
+    json["next_page_id"] = next_page_id_;
+    json["row_count"] = row_count_;
+    json["indexed_columns"] = indexed_columns_;
+    
+    std::string filename = "data/tables/" + name_ + ".schema";
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        return Status::Error("Cannot save metadata");
     }
+    
+    file << json.dump(4);
+    return Status::OK();
 }
 
-void TableIterator::loadCurrentPage() const {
-    if (table_ && current_page_id_ != INVALID_PAGE_ID) {
-        current_page_ = table_->buffer_pool_->fetchPage(
-            table_->schema_.id, current_page_id_);
-    }
 }
-
-} // namespace orangesql

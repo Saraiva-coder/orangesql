@@ -1,53 +1,78 @@
-#ifndef ORANGESQL_WAL_H
-#define ORANGESQL_WAL_H
+// transaction/wal.h
+#ifndef WAL_H
+#define WAL_H
 
-#include "log_manager.h"
-#include "../storage/buffer_pool.h"
+#include "../include/types.h"
+#include "../include/status.h"
+#include <vector>
+#include <string>
+#include <mutex>
+#include <fstream>
+#include <atomic>
 
 namespace orangesql {
 
-// Gerenciador de Write-Ahead Logging
-class WALManager {
-public:
-    WALManager(LogManager* log_manager, BufferPool* buffer_pool);
-    ~WALManager();
-    
-    // Operações com logging
-    LogSequenceNumber logInsert(TransactionId tx_id, PageId page_id,
-                                const std::vector<Value>& record, RecordId rid);
-    
-    LogSequenceNumber logUpdate(TransactionId tx_id, PageId page_id,
-                                const std::vector<Value>& old_record,
-                                const std::vector<Value>& new_record,
-                                RecordId rid);
-    
-    LogSequenceNumber logDelete(TransactionId tx_id, PageId page_id,
-                                const std::vector<Value>& record, RecordId rid);
-    
-    // Regras WAL
-    void beforePageWrite(PageId page_id, LogSequenceNumber lsn);
-    bool isPageDurable(PageId page_id) const;
-    
-    // Flush
-    void flush(LogSequenceNumber lsn);
-    void flushAll();
-    
-    // Recovery
-    Status recover();
-    
-private:
-    LogManager* log_manager_;
-    BufferPool* buffer_pool_;
-    
-    // Páginas que já foram flushed
-    std::unordered_map<PageId, LogSequenceNumber> durable_pages_;
-    mutable std::mutex mutex_;
-    
-    // Serialização de registros para log
-    std::vector<char> serializeRecord(const std::vector<Value>& record);
-    std::vector<Value> deserializeRecord(const char* data, size_t len);
+enum class WALRecordType {
+    BEGIN,
+    COMMIT,
+    ABORT,
+    INSERT,
+    UPDATE,
+    DELETE,
+    CHECKPOINT,
+    PREPARE
 };
 
-} // namespace orangesql
+struct WALRecord {
+    WALRecordType type;
+    uint64_t lsn;
+    uint64_t transaction_id;
+    uint64_t timestamp;
+    uint32_t page_id;
+    uint32_t offset;
+    std::vector<char> old_data;
+    std::vector<char> new_data;
+    std::string table_name;
+    uint64_t prev_lsn;
+    
+    WALRecord() : lsn(0), transaction_id(0), timestamp(0), page_id(0), offset(0), prev_lsn(0) {}
+    
+    std::vector<char> serialize() const;
+    static WALRecord deserialize(const std::vector<char>& data);
+    size_t getSize() const;
+};
 
-#endif // ORANGESQL_WAL_H
+class WALManager {
+public:
+    static WALManager& getInstance();
+    
+    Status init(const std::string& wal_dir);
+    Status appendRecord(const WALRecord& record);
+    Status flush();
+    Status truncate(uint64_t lsn);
+    
+    uint64_t getLastLSN() const { return last_lsn_; }
+    uint64_t getFlushedLSN() const { return flushed_lsn_; }
+    
+    Status recover(std::function<Status(const WALRecord&)> replay_func);
+    
+private:
+    WALManager();
+    ~WALManager();
+    
+    std::string wal_dir_;
+    std::ofstream wal_file_;
+    std::atomic<uint64_t> last_lsn_;
+    std::atomic<uint64_t> flushed_lsn_;
+    uint64_t current_segment_;
+    std::mutex mutex_;
+    
+    Status openSegment();
+    Status rotateSegment();
+    std::string getSegmentPath(uint64_t segment_id);
+    Status readSegment(uint64_t segment_id, std::vector<WALRecord>& records);
+};
+
+}
+
+#endif

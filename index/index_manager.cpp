@@ -1,399 +1,205 @@
+// index/index_manager.cpp
 #include "index_manager.h"
+#include "../include/logger.h"
 #include <fstream>
 #include <nlohmann/json.hpp>
 
 namespace orangesql {
 
-IndexManager::IndexManager(Catalog* catalog, BufferPool* buffer_pool)
-    : catalog_(catalog), buffer_pool_(buffer_pool) {
+Index::Index(const std::string& name, const std::string& table,
+             const std::string& column, bool unique)
+    : name_(name), table_(table), column_(column), unique_(unique), enabled_(true) {
+    btree_ = std::make_unique<ConcurrentBTree<std::string>>(BTREE_ORDER);
+}
+
+Index::~Index() {}
+
+Status Index::insert(const Value& key, uint64_t row_id) {
+    if (!enabled_) return Status::OK();
+    return btree_->insert(keyToString(key), row_id);
+}
+
+Status Index::search(const Value& key, std::vector<uint64_t>& row_ids) {
+    if (!enabled_) return Status::Error("Index disabled");
+    return btree_->search(keyToString(key), row_ids);
+}
+
+Status Index::searchRange(const Value& start, const Value& end, std::vector<uint64_t>& row_ids) {
+    if (!enabled_) return Status::Error("Index disabled");
+    return btree_->searchRange(keyToString(start), keyToString(end), row_ids);
+}
+
+Status Index::remove(const Value& key) {
+    if (!enabled_) return Status::OK();
+    return btree_->remove(keyToString(key));
+}
+
+Status Index::bulkLoad(const std::vector<Row>& rows, const std::vector<uint64_t>& row_ids) {
+    if (rows.size() != row_ids.size()) {
+        return Status::Error("Size mismatch");
+    }
     
-    // Carregar metadados dos índices
-    std::ifstream file(SYSTEM_DIR + std::string("/indexes.json"));
-    if (file.is_open()) {
-        nlohmann::json j;
-        file >> j;
-        
-        for (const auto& item : j) {
-            IndexMetadata meta;
-            meta.id = item["id"];
-            meta.name = item["name"];
-            meta.table_id = item["table_id"];
-            meta.table_name = item["table_name"];
-            meta.columns = item["columns"].get<std::vector<std::string>>();
-            meta.type = static_cast<IndexType>(item["type"]);
-            meta.unique = item["unique"];
-            meta.primary = item["primary"];
-            
-            name_to_id_[meta.name] = meta.id;
-        }
+    std::vector<std::pair<std::string, uint64_t>> data;
+    data.reserve(rows.size());
+    
+    for (size_t i = 0; i < rows.size(); i++) {
+        data.push_back({keyToString(rows[i].values[0]), row_ids[i]});
+    }
+    
+    return btree_->bulkLoad(data);
+}
+
+size_t Index::size() const {
+    return btree_->size();
+}
+
+std::string Index::keyToString(const Value& key) {
+    switch (key.type) {
+        case DataType::INTEGER:
+            return std::to_string(key.int_val);
+        case DataType::BIGINT:
+            return std::to_string(key.int_val);
+        case DataType::FLOAT:
+        case DataType::DOUBLE:
+            return std::to_string(key.double_val);
+        case DataType::TEXT:
+        case DataType::VARCHAR:
+            return key.str_val;
+        case DataType::BOOLEAN:
+            return key.bool_val ? "true" : "false";
+        default:
+            return "";
     }
 }
 
-IndexManager::~IndexManager() {
-    // Salvar metadados
-    nlohmann::json j = nlohmann::json::array();
-    
-    for (const auto& [name, id] : name_to_id_) {
-        IndexMetadata meta = getIndexMetadata(id);
-        nlohmann::json item;
-        item["id"] = meta.id;
-        item["name"] = meta.name;
-        item["table_id"] = meta.table_id;
-        item["table_name"] = meta.table_name;
-        item["columns"] = meta.columns;
-        item["type"] = static_cast<int>(meta.type);
-        item["unique"] = meta.unique;
-        item["primary"] = meta.primary;
-        j.push_back(item);
-    }
-    
-    std::ofstream file(SYSTEM_DIR + std::string("/indexes.json"));
-    file << j.dump(4);
-    
-    // Liberar cache
-    clearCache();
+IndexManager& IndexManager::getInstance() {
+    static IndexManager instance;
+    return instance;
 }
 
 Status IndexManager::createIndex(const std::string& name, const std::string& table,
-                                  const std::vector<std::string>& columns,
-                                  const IndexConfig& config) {
-    // Verificar se já existe
-    if (name_to_id_.find(name) != name_to_id_.end()) {
-        return Status::ALREADY_EXISTS;
+                                 const std::string& column, bool unique) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    
+    if (indexes_.find(name) != indexes_.end()) {
+        return Status::Error("Index already exists: " + name);
     }
     
-    // Obter schema da tabela
-    auto* table_schema = catalog_->getTable(table);
-    if (!table_schema) {
-        return Status::NOT_FOUND;
-    }
+    auto index = std::make_unique<Index>(name, table, column, unique);
+    indexes_[name] = std::move(index);
+    table_indexes_[table].push_back(name);
     
-    // Criar metadados
-    IndexMetadata meta;
-    meta.id = catalog_->getNextIndexId();
-    meta.name = name;
-    meta.table_id = table_schema->id;
-    meta.table_name = table;
-    meta.columns = columns;
-    meta.type = IndexType::BTREE;
-    meta.unique = config.unique;
-    meta.primary = false;
+    persist();
+    LOG_INFO("Index created: " + name);
     
-    // Criar arquivo do índice
-    std::string filename = getIndexFileName(meta.id);
-    std::ofstream file(filename, std::ios::binary);
-    if (!file) {
-        return Status::IO_ERROR;
-    }
-    
-    // Inicializar árvore
-    if (columns.size() == 1) {
-        // Índice simples
-        auto* table_obj = new Table(*table_schema, buffer_pool_); // TODO: Gerenciar lifecycle
-        
-        // Determinar tipo da coluna
-        size_t col_idx = table_schema->getColumnIndex(columns[0]);
-        DataType col_type = table_schema->columns[col_idx].type;
-        
-        // Criar índice apropriado
-        std::unique_ptr<void> index;
-        
-        switch (col_type) {
-            case DataType::INTEGER:
-                index = std::make_unique<IntIndex>(meta.id, buffer_pool_, config);
-                break;
-            case DataType::BIGINT:
-                index = std::make_unique<LongIndex>(meta.id, buffer_pool_, config);
-                break;
-            case DataType::VARCHAR:
-                index = std::make_unique<StringIndex>(meta.id, buffer_pool_, config);
-                break;
-            default:
-                return Status::ERROR;
-        }
-        
-        // Popular índice com dados existentes
-        for (auto it = table_obj->begin(); it != table_obj->end(); ++it) {
-            auto [rid, row] = *it;
-            
-            Value key = row[col_idx];
-            RecordId value = rid;
-            
-            switch (col_type) {
-                case DataType::INTEGER:
-                    static_cast<IntIndex*>(index.get())->insert(key.data.int_val, value);
-                    break;
-                case DataType::BIGINT:
-                    static_cast<LongIndex*>(index.get())->insert(key.data.bigint_val, value);
-                    break;
-                case DataType::VARCHAR:
-                    static_cast<StringIndex*>(index.get())->insert(key.str_val, value);
-                    break;
-                default:
-                    break;
-            }
-        }
-        
-        delete table_obj;
-        
-        // Cache do índice
-        cacheIndex(meta.id, std::move(index), IndexType::BTREE);
-    }
-    
-    // Salvar metadados
-    name_to_id_[name] = meta.id;
-    saveIndexMetadata(meta);
-    
-    return Status::OK;
+    return Status::OK();
 }
 
 Status IndexManager::dropIndex(const std::string& name) {
-    auto it = name_to_id_.find(name);
-    if (it == name_to_id_.end()) {
-        return Status::NOT_FOUND;
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    
+    auto it = indexes_.find(name);
+    if (it == indexes_.end()) {
+        return Status::NotFound("Index not found: " + name);
     }
     
-    return dropIndex(it->second);
+    const std::string& table = it->second->getTable();
+    auto& table_indices = table_indexes_[table];
+    table_indices.erase(std::remove(table_indices.begin(), table_indices.end(), name), table_indices.end());
+    
+    indexes_.erase(it);
+    persist();
+    LOG_INFO("Index dropped: " + name);
+    
+    return Status::OK();
 }
 
-Status IndexManager::dropIndex(IndexId id) {
-    // Remover do cache
-    index_cache_.erase(id);
+Index* IndexManager::getIndex(const std::string& name) {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     
-    // Remover dos metadados
-    for (auto it = name_to_id_.begin(); it != name_to_id_.end(); ++it) {
-        if (it->second == id) {
-            name_to_id_.erase(it);
-            break;
+    auto it = indexes_.find(name);
+    if (it != indexes_.end()) {
+        return it->second.get();
+    }
+    return nullptr;
+}
+
+Index* IndexManager::getIndexOnColumn(const std::string& table, const std::string& column) {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    
+    auto it = table_indexes_.find(table);
+    if (it != table_indexes_.end()) {
+        for (const auto& index_name : it->second) {
+            auto index_it = indexes_.find(index_name);
+            if (index_it != indexes_.end() && index_it->second->getColumn() == column) {
+                return index_it->second.get();
+            }
         }
     }
-    
-    // Remover arquivo
-    std::string filename = getIndexFileName(id);
-    std::remove(filename.c_str());
-    
-    return Status::OK;
+    return nullptr;
 }
 
-template<typename K, typename V>
-BTree<K, V>* IndexManager::getIndex(IndexId id) {
-    auto it = index_cache_.find(id);
+std::vector<Index*> IndexManager::getIndexesForTable(const std::string& table) {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     
-    if (it != index_cache_.end()) {
-        // Atualizar timestamp
-        it->second.last_used = std::chrono::steady_clock::now();
-        
-        // Retornar índice
-        if (it->second.type == IndexType::BTREE) {
-            return static_cast<BTree<K, V>*>(it->second.index.get());
+    std::vector<Index*> result;
+    auto it = table_indexes_.find(table);
+    if (it != table_indexes_.end()) {
+        for (const auto& index_name : it->second) {
+            auto index_it = indexes_.find(index_name);
+            if (index_it != indexes_.end()) {
+                result.push_back(index_it->second.get());
+            }
         }
     }
-    
-    // Carregar do disco
-    IndexMetadata meta = getIndexMetadata(id);
-    
-    // Criar índice baseado no tipo da coluna
-    std::unique_ptr<void> index;
-    
-    if (typeid(K) == typeid(int32_t)) {
-        index = std::make_unique<BTree<int32_t, V>>(id, buffer_pool_);
-    } else if (typeid(K) == typeid(int64_t)) {
-        index = std::make_unique<BTree<int64_t, V>>(id, buffer_pool_);
-    } else if (typeid(K) == typeid(std::string)) {
-        index = std::make_unique<BTree<std::string, V>>(id, buffer_pool_);
-    } else {
-        return nullptr;
-    }
-    
-    // Cache do índice
-    auto* ptr = static_cast<BTree<K, V>*>(index.get());
-    cacheIndex(id, std::move(index), IndexType::BTREE);
-    
-    return ptr;
-}
-
-template<typename K, typename V>
-BTree<K, V>* IndexManager::getIndex(const std::string& name) {
-    auto it = name_to_id_.find(name);
-    if (it == name_to_id_.end()) {
-        return nullptr;
-    }
-    
-    return getIndex<K, V>(it->second);
-}
-
-Status IndexManager::rebuildIndex(IndexId id) {
-    auto* table = catalog_->getTableById(getIndexMetadata(id).table_id);
-    if (!table) {
-        return Status::NOT_FOUND;
-    }
-    
-    // TODO: Reconstruir índice
-    return Status::OK;
-}
-
-Status IndexManager::rebuildAllIndexes() {
-    for (const auto& [name, id] : name_to_id_) {
-        Status status = rebuildIndex(id);
-        if (status != Status::OK) {
-            return status;
-        }
-    }
-    return Status::OK;
-}
-
-Status IndexManager::vacuumIndex(IndexId id) {
-    auto it = index_cache_.find(id);
-    if (it != index_cache_.end()) {
-        if (it->second.type == IndexType::BTREE) {
-            // TODO: Chamar vacuum específico do tipo
-        }
-    }
-    return Status::OK;
-}
-
-IndexMetadata IndexManager::getIndexMetadata(IndexId id) const {
-    IndexMetadata meta;
-    
-    // TODO: Carregar de arquivo de metadados
-    for (const auto& [name, idx_id] : name_to_id_) {
-        if (idx_id == id) {
-            meta.id = id;
-            meta.name = name;
-            // Carregar outros campos
-            break;
-        }
-    }
-    
-    return meta;
-}
-
-std::vector<IndexMetadata> IndexManager::listIndexes() const {
-    std::vector<IndexMetadata> result;
-    
-    for (const auto& [name, id] : name_to_id_) {
-        result.push_back(getIndexMetadata(id));
-    }
-    
     return result;
 }
 
-std::vector<IndexMetadata> IndexManager::listIndexes(const std::string& table) const {
-    std::vector<IndexMetadata> result;
-    
-    for (const auto& [name, id] : name_to_id_) {
-        auto meta = getIndexMetadata(id);
-        if (meta.table_name == table) {
-            result.push_back(meta);
-        }
-    }
-    
-    return result;
-}
-
-void IndexManager::clearCache() {
-    index_cache_.clear();
-}
-
-bool IndexManager::validateIndex(IndexId id) {
-    auto it = index_cache_.find(id);
-    if (it != index_cache_.end()) {
-        if (it->second.type == IndexType::BTREE) {
-            // TODO: Chamar validate específico
-            return true;
-        }
-    }
-    return false;
-}
-
-void IndexManager::cacheIndex(IndexId id, std::unique_ptr<void> index, IndexType type) {
-    // Limpar cache se necessário
-    if (index_cache_.size() >= MAX_CACHED_INDEXES) {
-        evictIndex();
-    }
-    
-    IndexEntry entry;
-    entry.index = std::move(index);
-    entry.type = type;
-    entry.last_used = std::chrono::steady_clock::now();
-    
-    index_cache_[id] = std::move(entry);
-}
-
-void IndexManager::evictIndex() {
-    // Encontrar índice menos recentemente usado
-    IndexId oldest_id = 0;
-    auto oldest_time = std::chrono::steady_clock::now();
-    
-    for (const auto& [id, entry] : index_cache_) {
-        if (entry.last_used < oldest_time) {
-            oldest_time = entry.last_used;
-            oldest_id = id;
-        }
-    }
-    
-    if (oldest_id != 0) {
-        index_cache_.erase(oldest_id);
-    }
-}
-
-void IndexManager::cleanupCache() {
-    // Remover índices não usados por muito tempo
-    auto now = std::chrono::steady_clock::now();
-    auto threshold = now - std::chrono::seconds(CACHE_CLEANUP_INTERVAL);
-    
-    for (auto it = index_cache_.begin(); it != index_cache_.end();) {
-        if (it->second.last_used < threshold) {
-            it = index_cache_.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
-std::string IndexManager::getIndexFileName(IndexId id) const {
-    return std::string(DATA_DIR) + "/index_" + std::to_string(id) + ".idx";
-}
-
-bool IndexManager::loadIndexMetadata(IndexId id, IndexMetadata& metadata) {
-    std::ifstream file(getIndexFileName(id) + ".meta");
+Status IndexManager::load() {
+    std::ifstream file("data/system/indexes.json");
     if (!file.is_open()) {
-        return false;
+        return Status::OK();
     }
     
-    nlohmann::json j;
-    file >> j;
+    nlohmann::json json;
+    file >> json;
     
-    metadata.id = j["id"];
-    metadata.name = j["name"];
-    metadata.table_id = j["table_id"];
-    metadata.table_name = j["table_name"];
-    metadata.columns = j["columns"].get<std::vector<std::string>>();
-    metadata.type = static_cast<IndexType>(j["type"]);
-    metadata.unique = j["unique"];
-    metadata.primary = j["primary"];
+    for (const auto& item : json["indexes"]) {
+        std::string name = item["name"];
+        std::string table = item["table"];
+        std::string column = item["column"];
+        bool unique = item["unique"];
+        
+        auto index = std::make_unique<Index>(name, table, column, unique);
+        indexes_[name] = std::move(index);
+        table_indexes_[table].push_back(name);
+    }
     
-    return true;
+    return Status::OK();
 }
 
-void IndexManager::saveIndexMetadata(const IndexMetadata& metadata) {
-    nlohmann::json j;
-    j["id"] = metadata.id;
-    j["name"] = metadata.name;
-    j["table_id"] = metadata.table_id;
-    j["table_name"] = metadata.table_name;
-    j["columns"] = metadata.columns;
-    j["type"] = static_cast<int>(metadata.type);
-    j["unique"] = metadata.unique;
-    j["primary"] = metadata.primary;
+Status IndexManager::persist() {
+    nlohmann::json json;
+    nlohmann::json indexes_json = nlohmann::json::array();
     
-    std::ofstream file(getIndexFileName(metadata.id) + ".meta");
-    file << j.dump(4);
+    for (const auto& [name, index] : indexes_) {
+        nlohmann::json item;
+        item["name"] = name;
+        item["table"] = index->getTable();
+        item["column"] = index->getColumn();
+        item["unique"] = index->isUnique();
+        indexes_json.push_back(item);
+    }
+    
+    json["indexes"] = indexes_json;
+    
+    std::ofstream file("data/system/indexes.json");
+    if (!file.is_open()) {
+        return Status::Error("Cannot save indexes metadata");
+    }
+    
+    file << json.dump(4);
+    return Status::OK();
 }
 
-// Instanciação explícita para tipos comuns
-template IntIndex* IndexManager::getIndex<int32_t, RecordId>(IndexId);
-template LongIndex* IndexManager::getIndex<int64_t, RecordId>(IndexId);
-template StringIndex* IndexManager::getIndex<std::string, RecordId>(IndexId);
-
-} // namespace orangesql
+}

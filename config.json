@@ -1,0 +1,40 @@
+// config.json
+{
+  "database": {
+    "name": "orangesql",
+    "data_dir": "./data",
+    "wal_dir": "./data/wal",
+    "page_size": 4096,
+    "buffer_pool_size": 8192,
+    "max_connections": 50,
+    "max_transactions": 1024
+  },
+  "performance": {
+    "cache_size_mb": 256,
+    "parallel_workers": 4,
+    "bulk_insert_threshold": 1000,
+    "use_direct_io": false,
+    "prefetch_pages": 8,
+    "sample_rate": 0.1
+  },
+  "index": {
+    "btree_order": 128,
+    "enable_bloom_filter": true,
+    "max_cache_size": 10000,
+    "enable_adaptive_merge": true
+  },
+  "transaction": {
+    "wal_enabled": true,
+    "checkpoint_interval_ms": 1000,
+    "lock_timeout_ms": 5000,
+    "deadlock_timeout_ms": 10000,
+    "isolation_level": "REPEATABLE_READ"
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "orangesql.log",
+    "max_size_mb": 100,
+    "rotate_daily": true,
+    "console_output": true
+  }
+}

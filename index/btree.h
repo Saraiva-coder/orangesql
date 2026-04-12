@@ -1,142 +1,59 @@
-#ifndef ORANGESQL_BTREE_H
-#define ORANGESQL_BTREE_H
+// index/btree.h
+#ifndef BTREE_H
+#define BTREE_H
 
+#include "../include/types.h"
+#include "../include/status.h"
 #include "btree_node.h"
-#include "../storage/buffer_pool.h"
-#include <functional>
-#include <stack>
+#include "btree_cache.h"
+#include <vector>
+#include <memory>
+#include <atomic>
+#include <shared_mutex>
 
 namespace orangesql {
 
-// Configurações do índice
-struct IndexConfig {
-    bool unique;           // Chaves únicas
-    bool allow_duplicates; // Permitir duplicatas
-    size_t fill_factor;    // Fator de preenchimento (%)
-    bool auto_vacuum;      // Compactar automaticamente
-    
-    IndexConfig() : unique(false), allow_duplicates(true),
-                   fill_factor(70), auto_vacuum(true) {}
-};
-
-// Estatísticas do índice
-struct IndexStats {
-    size_t total_keys;
-    size_t total_nodes;
-    size_t leaf_nodes;
-    size_t internal_nodes;
-    size_t height;
-    size_t cache_hits;
-    size_t cache_misses;
-    double avg_fill_factor;
-    
-    IndexStats() : total_keys(0), total_nodes(0), leaf_nodes(0),
-                  internal_nodes(0), height(0), cache_hits(0),
-                  cache_misses(0), avg_fill_factor(0) {}
-};
-
-// B-Tree Index
-template<typename K, typename V>
+template<typename KeyType>
 class BTree {
 public:
-    // Iterator para range scans
-    class Iterator {
-    public:
-        Iterator(BTree* tree, bool end = false);
-        ~Iterator() = default;
-        
-        bool operator!=(const Iterator& other) const;
-        Iterator& operator++();
-        Iterator operator++(int);
-        std::pair<K, V> operator*() const;
-        
-    private:
-        BTree* tree_;
-        PageId current_page_;
-        uint16_t current_slot_;
-        bool is_end_;
-        std::unique_ptr<BTreeNode<K, V>> current_node_;
-        
-        void loadCurrentNode();
-        void advance();
-    };
-    
-    BTree(IndexId id, BufferPool* buffer_pool, const IndexConfig& config = IndexConfig());
+    explicit BTree(int order = BTREE_ORDER);
     ~BTree();
     
-    // Operações principais
-    Status insert(const K& key, const V& value);
-    Status remove(const K& key);
-    Status find(const K& key, V& value) const;
-    std::vector<V> findMany(const K& key) const;  // Para duplicatas
+    Status insert(const KeyType& key, uint64_t record_id);
+    Status search(const KeyType& key, std::vector<uint64_t>& record_ids);
+    Status searchRange(const KeyType& start, const KeyType& end, std::vector<uint64_t>& record_ids);
+    Status remove(const KeyType& key);
+    Status update(const KeyType& old_key, const KeyType& new_key, uint64_t record_id);
     
-    // Range queries
-    std::vector<V> rangeQuery(const K& start, const K& end);
-    std::vector<std::pair<K, V>> rangeQueryWithKeys(const K& start, const K& end);
+    size_t size() const { return size_; }
+    int height() const { return height_; }
+    size_t getNodeCount() const { return node_count_; }
     
-    // Bulk operations
-    Status bulkInsert(const std::vector<std::pair<K, V>>& entries);
-    size_t bulkDelete(const std::vector<K>& keys);
+    Status bulkLoad(const std::vector<std::pair<KeyType, uint64_t>>& data);
     
-    // Scans
-    Iterator begin() { return Iterator(this, false); }
-    Iterator end() { return Iterator(this, true); }
-    Iterator findFirst(const K& key);
-    Iterator findLast(const K& key);
-    
-    // Estatísticas e debug
-    IndexStats getStats() const;
-    void validate() const;
-    void dump() const;
-    
-    // Manutenção
-    Status vacuum();                    // Compactar
-    Status rebuild();                    // Reconstruir
-    
-    // Configuração
-    void setConfig(const IndexConfig& config) { config_ = config; }
-    IndexConfig getConfig() const { return config_; }
+    void setCacheSize(size_t cache_size);
+    void enableConcurrent(bool enable);
     
 private:
-    IndexId id_;
-    BufferPool* buffer_pool_;
-    IndexConfig config_;
-    PageId root_page_id_;
-    mutable IndexStats stats_;
+    int order_;
+    size_t size_;
+    int height_;
+    size_t node_count_;
+    uint64_t root_id_;
+    std::unique_ptr<BTreeCache<KeyType>> cache_;
+    std::shared_mutex mutex_;
+    std::atomic<bool> concurrent_enabled_;
     
-    // Gerenciamento de nós
-    BTreeNode<K, V>* getNode(PageId page_id) const;
-    void releaseNode(BTreeNode<K, V>* node) const;
-    PageId createNode(BTreeNodeType type);
-    void deleteNode(PageId page_id);
-    
-    // Operações internas
-    Status insertInternal(const K& key, const V& value, PageId node_page);
-    Status removeInternal(const K& key, PageId node_page);
-    BTreeNode<K, V>* findLeaf(const K& key) const;
-    
-    // Split e merge
-    void splitChild(BTreeNode<K, V>* parent, int child_index);
-    bool mergeNodes(BTreeNode<K, V>* parent, int index);
-    void redistribute(BTreeNode<K, V>* parent, int index, bool from_left);
-    
-    // Balanceamento
-    void handleUnderflow(BTreeNode<K, V>* node, PageId parent_page, int index_in_parent);
-    
-    // Traversal
-    void traverse(std::function<void(const K&, const V&)> func) const;
-    
-    // Validação
-    bool validateNode(const BTreeNode<K, V>* node, const K& min_key, const K& max_key) const;
-    
-    friend class Iterator;
+    Status insertInternal(BTreeNode<KeyType>* node, const KeyType& key, uint64_t record_id);
+    Status splitNode(BTreeNode<KeyType>* node);
+    Status findLeaf(const KeyType& key, BTreeNode<KeyType>*& leaf);
+    BTreeNode<KeyType>* loadNode(uint64_t node_id);
+    Status saveNode(BTreeNode<KeyType>* node);
+    void deleteNode(BTreeNode<KeyType>* node);
+    uint64_t allocateNodeId();
+    void updateParent(BTreeNode<KeyType>* node, const KeyType& key, uint64_t child_id);
 };
 
-// Tipos comuns de índices
-using IntIndex = BTree<int32_t, RecordId>;
-using LongIndex = BTree<int64_t, RecordId>;
-using StringIndex = BTree<std::string, RecordId>;
+}
 
-} // namespace orangesql
-
-#endif // ORANGESQL_BTREE_H
+#endif

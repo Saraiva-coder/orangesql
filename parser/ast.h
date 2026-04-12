@@ -1,7 +1,7 @@
-#ifndef ORANGESQL_AST_H
-#define ORANGESQL_AST_H
+// parser/ast.h
+#ifndef AST_H
+#define AST_H
 
-#include "../include/types.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -9,369 +9,129 @@
 
 namespace orangesql {
 
-// Tipos de nós da AST
-enum class ASTNodeType {
-    // Comandos DDL
-    CREATE_TABLE,
-    DROP_TABLE,
-    CREATE_INDEX,
-    DROP_INDEX,
-    ALTER_TABLE,
-    
-    // Comandos DML
+enum class NodeType {
     SELECT,
     INSERT,
     UPDATE,
     DELETE,
-    
-    // Comandos DCL
-    BEGIN,
-    COMMIT,
-    ROLLBACK,
-    
-    // Expressões
-    BINARY_EXPR,
-    UNARY_EXPR,
-    COLUMN_REF,
-    LITERAL,
-    FUNCTION_CALL,
-    
-    // Cláusulas
-    WHERE_CLAUSE,
-    JOIN_CLAUSE,
-    ORDER_BY,
-    GROUP_BY,
-    HAVING,
-    LIMIT
+    CREATE_TABLE,
+    CREATE_INDEX,
+    DROP_TABLE,
+    DROP_INDEX,
+    UNKNOWN
 };
 
-// Tipos de operadores
 enum class Operator {
-    // Aritméticos
-    PLUS, MINUS, MULTIPLY, DIVIDE, MODULO,
-    
-    // Comparação
-    EQ, NE, LT, LE, GT, GE,
-    LIKE, NOT_LIKE,
-    IN, NOT_IN,
-    IS_NULL, IS_NOT_NULL,
-    BETWEEN, NOT_BETWEEN,
-    
-    // Lógicos
-    AND, OR, NOT,
-    
-    // Outros
-    ASSIGN,
-    CONCAT
+    EQ,
+    NE,
+    GT,
+    LT,
+    GE,
+    LE,
+    LIKE,
+    AND,
+    OR,
+    IN,
+    BETWEEN,
+    IS_NULL,
+    IS_NOT_NULL
 };
 
-// Tipos de joins
-enum class JoinType {
-    INNER,
-    LEFT,
-    RIGHT,
-    FULL,
-    CROSS,
-    NATURAL
-};
-
-// Nó base da AST
-struct ASTNode {
-    ASTNodeType type;
-    int line;
-    int column;
-    
-    ASTNode(ASTNodeType t) : type(t), line(0), column(0) {}
-    virtual ~ASTNode() = default;
-};
-
-// Literal (constante)
-struct LiteralNode : ASTNode {
-    Value value;
-    
-    LiteralNode() : ASTNode(ASTNodeType::LITERAL) {}
-    explicit LiteralNode(const Value& v) : ASTNode(ASTNodeType::LITERAL), value(v) {}
-};
-
-// Referência a coluna
-struct ColumnRefNode : ASTNode {
-    std::string table;
+struct Condition {
     std::string column;
-    
-    ColumnRefNode() : ASTNode(ASTNodeType::COLUMN_REF) {}
-    ColumnRefNode(const std::string& col) : ASTNode(ASTNodeType::COLUMN_REF), column(col) {}
-    ColumnRefNode(const std::string& tbl, const std::string& col) 
-        : ASTNode(ASTNodeType::COLUMN_REF), table(tbl), column(col) {}
-};
-
-// Expressão binária
-struct BinaryExprNode : ASTNode {
     Operator op;
-    std::unique_ptr<ASTNode> left;
-    std::unique_ptr<ASTNode> right;
+    std::string value;
+    std::string column2;
+    std::vector<std::string> in_values;
+    std::string between_start;
+    std::string between_end;
     
-    BinaryExprNode() : ASTNode(ASTNodeType::BINARY_EXPR) {}
-    BinaryExprNode(Operator o, std::unique_ptr<ASTNode> l, std::unique_ptr<ASTNode> r)
-        : ASTNode(ASTNodeType::BINARY_EXPR), op(o), left(std::move(l)), right(std::move(r)) {}
+    Condition() : op(Operator::EQ) {}
 };
 
-// Expressão unária
-struct UnaryExprNode : ASTNode {
-    Operator op;
-    std::unique_ptr<ASTNode> expr;
-    
-    UnaryExprNode() : ASTNode(ASTNodeType::UNARY_EXPR) {}
-    UnaryExprNode(Operator o, std::unique_ptr<ASTNode> e)
-        : ASTNode(ASTNodeType::UNARY_EXPR), op(o), expr(std::move(e)) {}
+struct WhereClause {
+    std::vector<Condition> conditions;
+    bool has_range = false;
+    std::string start_value;
+    std::string end_value;
+    std::string value;
 };
 
-// Chamada de função
-struct FunctionCallNode : ASTNode {
-    std::string name;
-    std::vector<std::unique_ptr<ASTNode>> arguments;
-    bool is_aggregate;
-    
-    FunctionCallNode() : ASTNode(ASTNodeType::FUNCTION_CALL), is_aggregate(false) {}
-    FunctionCallNode(const std::string& n) 
-        : ASTNode(ASTNodeType::FUNCTION_CALL), name(n), is_aggregate(false) {}
-};
-
-// Expressão (usando variant)
-using Expr = std::variant<
-    std::unique_ptr<LiteralNode>,
-    std::unique_ptr<ColumnRefNode>,
-    std::unique_ptr<BinaryExprNode>,
-    std::unique_ptr<UnaryExprNode>,
-    std::unique_ptr<FunctionCallNode>
->;
-
-// Definição de coluna em CREATE TABLE
-struct ColumnDef {
-    std::string name;
-    DataType type;
-    int length;  // Para VARCHAR
-    bool nullable;
-    bool primary_key;
-    bool unique;
-    std::unique_ptr<ASTNode> default_value;
-    std::string check_expr;
-    
-    ColumnDef() : type(DataType::INTEGER), length(0), nullable(true), 
-                  primary_key(false), unique(false) {}
-};
-
-// Cláusula WHERE
-struct WhereClause : ASTNode {
-    std::unique_ptr<ASTNode> condition;
-    
-    WhereClause() : ASTNode(ASTNodeType::WHERE_CLAUSE) {}
-    explicit WhereClause(std::unique_ptr<ASTNode> cond) 
-        : ASTNode(ASTNodeType::WHERE_CLAUSE), condition(std::move(cond)) {}
-};
-
-// Cláusula JOIN
-struct JoinClause : ASTNode {
-    JoinType type;
+struct JoinClause {
+    std::string type;
     std::string table;
-    std::string alias;
-    std::unique_ptr<ASTNode> condition;
-    std::vector<std::string> using_columns;
-    
-    JoinClause() : ASTNode(ASTNodeType::JOIN_CLAUSE), type(JoinType::INNER) {}
+    std::string left_column;
+    std::string right_column;
 };
 
-// Cláusula ORDER BY
-struct OrderByNode : ASTNode {
-    struct Item {
-        std::unique_ptr<ASTNode> expr;
-        bool ascending;
-    };
-    std::vector<Item> items;
-    
-    OrderByNode() : ASTNode(ASTNodeType::ORDER_BY) {}
-};
-
-// Cláusula GROUP BY
-struct GroupByNode : ASTNode {
-    std::vector<std::unique_ptr<ASTNode>> columns;
-    
-    GroupByNode() : ASTNode(ASTNodeType::GROUP_BY) {}
-};
-
-// Cláusula LIMIT
-struct LimitNode : ASTNode {
+struct SelectStatement {
+    std::vector<std::string> columns;
+    std::string table_name;
+    WhereClause where_clause;
+    std::vector<JoinClause> joins;
+    std::vector<std::string> group_by;
+    std::vector<std::pair<std::string, std::string>> order_by;
     int limit;
     int offset;
-    
-    LimitNode() : ASTNode(ASTNodeType::LIMIT), limit(-1), offset(0) {}
-    LimitNode(int l, int o) : ASTNode(ASTNodeType::LIMIT), limit(l), offset(o) {}
-};
-
-// Nó SELECT
-struct SelectNode : ASTNode {
-    // SELECT clause
     bool distinct;
-    std::vector<std::unique_ptr<ASTNode>> select_list;
-    std::vector<std::string> select_aliases;
     
-    // FROM clause
-    struct TableRef {
-        std::string table_name;
-        std::string alias;
-        std::unique_ptr<SelectNode> subquery;
-    };
-    std::vector<TableRef> from_tables;
-    
-    // JOINs
-    std::vector<std::unique_ptr<JoinClause>> joins;
-    
-    // WHERE
-    std::unique_ptr<WhereClause> where;
-    
-    // GROUP BY
-    std::unique_ptr<GroupByNode> group_by;
-    
-    // HAVING
-    std::unique_ptr<WhereClause> having;
-    
-    // ORDER BY
-    std::unique_ptr<OrderByNode> order_by;
-    
-    // LIMIT/OFFSET
-    std::unique_ptr<LimitNode> limit;
-    
-    // UNION/INTERSECT/EXCEPT
-    enum class SetOperation {
-        NONE, UNION, UNION_ALL, INTERSECT, EXCEPT
-    };
-    SetOperation set_operation;
-    std::unique_ptr<SelectNode> set_operand;
-    
-    SelectNode() : ASTNode(ASTNodeType::SELECT), distinct(false), 
-                   set_operation(SetOperation::NONE) {}
+    SelectStatement() : limit(-1), offset(0), distinct(false) {}
 };
 
-// Nó INSERT
-struct InsertNode : ASTNode {
-    std::string table;
-    std::vector<std::string> columns;
-    std::vector<std::vector<std::unique_ptr<ASTNode>>> values;
-    std::unique_ptr<SelectNode> select;  // INSERT ... SELECT
-    
-    InsertNode() : ASTNode(ASTNodeType::INSERT) {}
-};
-
-// Nó UPDATE
-struct UpdateNode : ASTNode {
-    std::string table;
-    struct Assignment {
-        std::string column;
-        std::unique_ptr<ASTNode> value;
-    };
-    std::vector<Assignment> assignments;
-    std::unique_ptr<WhereClause> where;
-    
-    UpdateNode() : ASTNode(ASTNodeType::UPDATE) {}
-};
-
-// Nó DELETE
-struct DeleteNode : ASTNode {
-    std::string table;
-    std::unique_ptr<WhereClause> where;
-    
-    DeleteNode() : ASTNode(ASTNodeType::DELETE) {}
-};
-
-// Nó CREATE TABLE
-struct CreateTableNode : ASTNode {
+struct InsertStatement {
     std::string table_name;
-    std::vector<ColumnDef> columns;
-    struct Constraint {
-        enum Type { PRIMARY_KEY, FOREIGN_KEY, UNIQUE, CHECK };
-        Type type;
-        std::vector<std::string> columns;
-        std::string ref_table;
-        std::vector<std::string> ref_columns;
-        std::string check_expr;
-    };
-    std::vector<Constraint> constraints;
-    
-    CreateTableNode() : ASTNode(ASTNodeType::CREATE_TABLE) {}
+    std::vector<std::string> columns;
+    std::vector<std::vector<std::string>> values;
 };
 
-// Nó CREATE INDEX
-struct CreateIndexNode : ASTNode {
+struct UpdateStatement {
+    std::string table_name;
+    std::vector<std::pair<std::string, std::string>> set_clause;
+    WhereClause where_clause;
+};
+
+struct DeleteStatement {
+    std::string table_name;
+    WhereClause where_clause;
+};
+
+struct CreateTableStatement {
+    std::string table_name;
+    std::vector<std::tuple<std::string, std::string, bool>> columns;
+    std::vector<std::string> primary_keys;
+};
+
+struct CreateIndexStatement {
     std::string index_name;
     std::string table_name;
-    std::vector<std::string> columns;
+    std::string column;
     bool unique;
     
-    CreateIndexNode() : ASTNode(ASTNodeType::CREATE_INDEX), unique(false) {}
+    CreateIndexStatement() : unique(false) {}
 };
 
-// Nó DROP TABLE
-struct DropTableNode : ASTNode {
+struct DropTableStatement {
     std::string table_name;
-    bool if_exists;
-    
-    DropTableNode() : ASTNode(ASTNodeType::DROP_TABLE), if_exists(false) {}
 };
 
-// Nó BEGIN TRANSACTION
-struct BeginNode : ASTNode {
-    std::string name;  // savepoint name
-    bool is_savepoint;
-    
-    BeginNode() : ASTNode(ASTNodeType::BEGIN), is_savepoint(false) {}
+struct DropIndexStatement {
+    std::string index_name;
 };
 
-// Nó COMMIT
-struct CommitNode : ASTNode {
-    std::string name;  // savepoint name
-    bool is_savepoint;
+struct ASTNode {
+    NodeType type;
+    SelectStatement select_stmt;
+    InsertStatement insert_stmt;
+    UpdateStatement update_stmt;
+    DeleteStatement delete_stmt;
+    CreateTableStatement create_table_stmt;
+    CreateIndexStatement create_index_stmt;
+    DropTableStatement drop_table_stmt;
+    DropIndexStatement drop_index_stmt;
     
-    CommitNode() : ASTNode(ASTNodeType::COMMIT), is_savepoint(false) {}
+    ASTNode() : type(NodeType::UNKNOWN) {}
 };
 
-// Nó ROLLBACK
-struct RollbackNode : ASTNode {
-    std::string name;  // savepoint name
-    bool is_savepoint;
-    
-    RollbackNode() : ASTNode(ASTNodeType::ROLLBACK), is_savepoint(false) {}
-};
-
-// Funções auxiliares
-inline std::string operatorToString(Operator op) {
-    switch(op) {
-        case Operator::PLUS: return "+";
-        case Operator::MINUS: return "-";
-        case Operator::MULTIPLY: return "*";
-        case Operator::DIVIDE: return "/";
-        case Operator::MODULO: return "%";
-        case Operator::EQ: return "=";
-        case Operator::NE: return "!=";
-        case Operator::LT: return "<";
-        case Operator::LE: return "<=";
-        case Operator::GT: return ">";
-        case Operator::GE: return ">=";
-        case Operator::LIKE: return "LIKE";
-        case Operator::NOT_LIKE: return "NOT LIKE";
-        case Operator::IN: return "IN";
-        case Operator::NOT_IN: return "NOT IN";
-        case Operator::IS_NULL: return "IS NULL";
-        case Operator::IS_NOT_NULL: return "IS NOT NULL";
-        case Operator::BETWEEN: return "BETWEEN";
-        case Operator::NOT_BETWEEN: return "NOT BETWEEN";
-        case Operator::AND: return "AND";
-        case Operator::OR: return "OR";
-        case Operator::NOT: return "NOT";
-        case Operator::ASSIGN: return ":=";
-        case Operator::CONCAT: return "||";
-        default: return "UNKNOWN";
-    }
 }
 
-} // namespace orangesql
-
-#endif // ORANGESQL_AST_H
+#endif

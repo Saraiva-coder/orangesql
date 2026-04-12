@@ -1,141 +1,74 @@
-#ifndef ORANGESQL_LOCK_MANAGER_H
-#define ORANGESQL_LOCK_MANAGER_H
+// transaction/lock_manager.h
+#ifndef LOCK_MANAGER_H
+#define LOCK_MANAGER_H
 
 #include "../include/types.h"
-#include "../include/constants.h"
+#include "../include/status.h"
 #include <unordered_map>
-#include <set>
 #include <queue>
-#include <chrono>
+#include <shared_mutex>
+#include <condition_variable>
 
 namespace orangesql {
 
-// Modos de lock
-enum class LockMode {
-    SHARED,        // Leitura
-    EXCLUSIVE,     // Escrita
-    INTENT_SHARED, // Intenção de leitura
-    INTENT_EXCLUSIVE, // Intenção de escrita
-    SHARED_INTENT_EXCLUSIVE // Leitura com intenção de escrita
+enum class LockType {
+    SHARED,
+    EXCLUSIVE,
+    UPDATE
 };
 
-// Granularidade do lock
-enum class LockGranularity {
-    TABLE,
-    PAGE,
-    ROW
-};
-
-// Status do lock
-enum class LockStatus {
-    GRANTED,
-    WAITING,
-    TIMEOUT,
-    DEADLOCK
-};
-
-// Entrada de lock
-struct LockEntry {
-    LockMode mode;
-    TransactionId holder;
-    LockGranularity granularity;
-    std::chrono::system_clock::time_point granted_time;
+struct LockRequest {
+    uint64_t transaction_id;
+    LockType type;
+    bool granted;
+    std::chrono::steady_clock::time_point request_time;
     
-    LockEntry(LockMode m, TransactionId t, LockGranularity g)
-        : mode(m), holder(t), granularity(g),
-          granted_time(std::chrono::system_clock::now()) {}
+    LockRequest() : transaction_id(0), type(LockType::SHARED), granted(false) {}
+    LockRequest(uint64_t tid, LockType t) : transaction_id(tid), type(t), granted(false) {}
 };
 
-// Fila de espera
-struct LockWaitEntry {
-    TransactionId waiter;
-    LockMode requested_mode;
-    std::chrono::system_clock::time_point request_time;
+struct Lock {
+    uint64_t resource_id;
+    LockType granted_type;
+    std::vector<LockRequest> queue;
+    std::unordered_map<uint64_t, LockType> holders;
     
-    LockWaitEntry(TransactionId t, LockMode m)
-        : waiter(t), requested_mode(m),
-          request_time(std::chrono::system_clock::now()) {}
+    Lock() : resource_id(0), granted_type(LockType::SHARED) {}
+    explicit Lock(uint64_t rid) : resource_id(rid), granted_type(LockType::SHARED) {}
 };
 
-// Estatísticas de locks
-struct LockStats {
-    size_t total_locks;
-    size_t granted_locks;
-    size_t waiting_locks;
-    size_t deadlocks_detected;
-    size_t lock_timeouts;
-    double avg_wait_time_ms;
-    
-    LockStats() : total_locks(0), granted_locks(0), waiting_locks(0),
-                 deadlocks_detected(0), lock_timeouts(0), avg_wait_time_ms(0) {}
-};
-
-// Gerenciador de locks (2PL - Two-Phase Locking)
 class LockManager {
 public:
-    LockManager(BufferPool* buffer_pool);
+    static LockManager& getInstance();
+    
+    Status acquireLock(uint64_t transaction_id, uint64_t resource_id, LockType type);
+    Status releaseLock(uint64_t transaction_id, uint64_t resource_id);
+    Status releaseAllLocks(uint64_t transaction_id);
+    
+    bool isLocked(uint64_t resource_id);
+    LockType getLockType(uint64_t transaction_id, uint64_t resource_id);
+    
+    void setDeadlockTimeout(int milliseconds);
+    void setLockTimeout(int milliseconds);
+    
+private:
+    LockManager();
     ~LockManager();
     
-    // Aquisição de locks
-    LockStatus acquireLock(TransactionId tx_id, const std::string& resource,
-                          LockMode mode, LockGranularity granularity,
-                          uint64_t timeout_ms = 5000);
+    std::unordered_map<uint64_t, Lock> locks_;
+    std::unordered_map<uint64_t, std::vector<uint64_t>> transaction_locks_;
+    std::shared_mutex mutex_;
     
-    // Liberação de locks
-    bool releaseLock(TransactionId tx_id, const std::string& resource);
-    bool releaseAllLocks(TransactionId tx_id);
+    int deadlock_timeout_ms_;
+    int lock_timeout_ms_;
     
-    // Upgrade de lock
-    LockStatus upgradeLock(TransactionId tx_id, const std::string& resource,
-                          LockMode new_mode);
-    
-    // Verificação
-    bool hasLock(TransactionId tx_id, const std::string& resource, LockMode mode) const;
-    bool isLocked(const std::string& resource) const;
-    LockMode getLockMode(const std::string& resource) const;
-    
-    // Wait-for graph
-    std::vector<TransactionId> getWaitingTransactions(TransactionId tx_id) const;
-    bool hasDeadlock(TransactionId tx_id) const;
-    
-    // Estatísticas
-    const LockStats& getStats() const { return stats_; }
-    void resetStats();
-    
-    // Debug
-    void dumpLocks() const;
-    void dumpWaitGraph() const;
-
-private:
-    BufferPool* buffer_pool_;
-    
-    // Locks concedidos
-    std::unordered_map<std::string, std::vector<LockEntry>> granted_locks_;
-    
-    // Filas de espera
-    std::unordered_map<std::string, std::queue<LockWaitEntry>> wait_queues_;
-    
-    // Mapa de transações esperando
-    std::unordered_map<TransactionId, std::vector<std::string>> waiting_for_;
-    
-    // Estatísticas
-    mutable LockStats stats_;
-    mutable std::mutex mutex_;
-    
-    // Compatibilidade de modos
-    bool areCompatible(LockMode existing, LockMode requested) const;
-    bool canGrant(const std::vector<LockEntry>& current_locks, LockMode requested) const;
-    
-    // Deadlock detection
-    bool checkDeadlock(TransactionId start_tx, 
-                      std::unordered_map<TransactionId, bool>& visited,
-                      std::unordered_map<TransactionId, TransactionId>& parent);
-    
-    // Timeout handling
-    void checkTimeouts();
-    void removeFromWaitQueue(const std::string& resource, TransactionId tx_id);
+    bool detectDeadlock(uint64_t transaction_id, uint64_t resource_id);
+    bool isCompatible(LockType held, LockType requested);
+    void grantLock(Lock& lock, LockRequest& request);
+    void upgradeLock(Lock& lock, uint64_t transaction_id);
+    bool waitForLock(Lock& lock, uint64_t transaction_id);
 };
 
-} // namespace orangesql
+}
 
-#endif // ORANGESQL_LOCK_MANAGER_H
+#endif

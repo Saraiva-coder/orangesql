@@ -1,115 +1,57 @@
-#ifndef ORANGESQL_TABLE_H
-#define ORANGESQL_TABLE_H
+// storage/table.h
+#ifndef TABLE_H
+#define TABLE_H
 
+#include "../include/types.h"
+#include "../include/status.h"
 #include "page.h"
 #include "buffer_pool.h"
-#include "../metadata/schema.h"
 #include <vector>
-#include <memory>
+#include <string>
+#include <unordered_map>
+#include <shared_mutex>
 
 namespace orangesql {
 
-// Opções de scan
-struct ScanOptions {
-    bool descending;
-    size_t limit;
-    std::vector<std::pair<std::string, bool>> order_by; // column, asc
-    
-    ScanOptions() : descending(false), limit(0) {}
-};
-
-// Iterador de tabela
-class TableIterator {
-public:
-    TableIterator() : table_(nullptr), current_page_id_(INVALID_PAGE_ID), current_slot_(0) {}
-    TableIterator(class Table* table, PageId page_id, uint16_t slot);
-    
-    // Operadores
-    TableIterator& operator++();
-    TableIterator operator++(int);
-    bool operator==(const TableIterator& other) const;
-    bool operator!=(const TableIterator& other) const;
-    
-    // Acesso
-    std::pair<RecordId, std::vector<Value>> operator*() const;
-    RecordId getRecordId() const;
-    
-private:
-    class Table* table_;
-    PageId current_page_id_;
-    uint16_t current_slot_;
-    mutable Page* current_page_;
-    
-    void advanceToNextValid();
-    void loadCurrentPage() const;
-};
-
-// Tabela
 class Table {
 public:
-    Table(const TableSchema& schema, BufferPool* buffer_pool);
-    ~Table() = default;
+    Table(const std::string& name, const std::vector<Column>& schema);
+    ~Table();
     
-    // Operações CRUD
-    Status insertRecord(const std::vector<Value>& values, RecordId& rid);
-    Status getRecord(RecordId rid, std::vector<Value>& values);
-    Status updateRecord(RecordId rid, const std::vector<Value>& values);
-    Status deleteRecord(RecordId rid);
+    Status insertRow(Row& row);
+    Status getRow(uint64_t row_id, Row& row);
+    Status updateRow(uint64_t row_id, const Row& row);
+    Status deleteRow(uint64_t row_id);
+    Status getAllRowIds(std::vector<uint64_t>& row_ids);
     
-    // Operações em lote
-    size_t insertRecords(const std::vector<std::vector<Value>>& records, 
-                         std::vector<RecordId>& rids);
-    size_t deleteRecords(const std::vector<RecordId>& rids);
-    
-    // Scans
-    TableIterator begin();
-    TableIterator end();
-    TableIterator find(const std::vector<Value>& key);
-    
-    // Scan com opções
-    std::vector<std::vector<Value>> scan(const ScanOptions& options);
-    
-    // Estatísticas
-    size_t getRecordCount();
-    size_t getPageCount();
-    
-    // Getters
-    const TableSchema& getSchema() const { return schema_; }
-    TableId getId() const { return schema_.id; }
-    const std::string& getName() const { return schema_.name; }
-    
-    // Validação
-    bool validateRecord(const std::vector<Value>& values) const;
-    bool validateColumn(size_t col_idx, const Value& value) const;
-    
-    // Schema
-    size_t getColumnIndex(const std::string& name) const;
-    DataType getColumnType(size_t idx) const;
-    
-    // Debug
-    void dump() const;
+    const std::string& getName() const { return name_; }
+    const std::vector<Column>& getSchema() const { return schema_; }
+    int getColumnIndex(const std::string& name) const;
+    const Column& getColumn(int index) const { return schema_[index]; }
+    bool hasIndexOnColumn(const std::string& column) const;
+    void addIndex(const std::string& column);
+    size_t getRowCount() const { return row_count_; }
     
 private:
-    TableSchema schema_;
+    std::string name_;
+    std::vector<Column> schema_;
+    std::unordered_map<std::string, int> column_index_;
+    std::unordered_set<std::string> indexed_columns_;
     BufferPool* buffer_pool_;
+    FileManager file_manager_;
+    int file_id_;
+    uint32_t next_page_id_;
+    size_t row_count_;
+    mutable std::shared_mutex mutex_;
     
-    // Cache da primeira página
-    Page* first_page_;
-    Page* last_page_;
-    
-    // Estatísticas
-    mutable std::atomic<size_t> cached_record_count_;
-    mutable std::atomic<size_t> cached_page_count_;
-    mutable std::chrono::steady_clock::time_point stats_update_time_;
-    
-    // Métodos internos
-    Page* getPage(PageId page_id);
-    Page* getOrCreateFirstPage();
-    Page* appendNewPage();
-    
-    friend class TableIterator;
+    Status serializeRow(const Row& row, std::vector<char>& data);
+    Status deserializeRow(const std::vector<char>& data, Row& row);
+    uint64_t generateRowId(uint32_t page_id, uint32_t offset);
+    void parseRowId(uint64_t row_id, uint32_t& page_id, uint32_t& offset);
+    Status loadMetadata();
+    Status saveMetadata();
 };
 
-} // namespace orangesql
+}
 
-#endif // ORANGESQL_TABLE_H
+#endif
